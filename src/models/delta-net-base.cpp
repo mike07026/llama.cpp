@@ -476,6 +476,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
@@ -501,7 +503,34 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
+        // During decode (n_seq_tokens == 1) the for-loop below can only
+        // compute a meaningful conv_state for slot_0 (t=K).  Slots 1..K-1
+        // would all clamp to the same oldest conv_row and become stale.
+        // Shift existing snapshots right as a shift register BEFORE writing
+        // the new slot_0 so that slot_k contains the conv_state from k
+        // steps ago — matching the s_copy() / rs_idx snapshot semantics.
+        if (n_seq_tokens == 1 && K > 1) {
+            for (int64_t slot = K - 1; slot >= 1; --slot) {
+                ggml_tensor * shift_src = ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs,
+                    conv_states_all->nb[1],
+                    ((slot - 1) * (int64_t) mem_size + kv_head) * row_size);
+                ggml_tensor * shift_dst = ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs,
+                    conv_states_all->nb[1],
+                    (slot * (int64_t) mem_size + kv_head) * row_size);
+
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, shift_src, shift_dst));
+            }
+        }
+
         for (int64_t t = 1; t <= K; ++t) {
+            // During decode only slot_0 (t=K) carries fresh data;
+            // older slots were already populated by the shift above.
+            if (n_seq_tokens == 1 && t != K) {
+                continue;
+            }
+
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
