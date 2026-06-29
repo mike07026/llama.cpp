@@ -786,6 +786,9 @@ extern "C" {
     // because recurrent tensors are reallocated and graph nodes hold tensor pointers.
     LLAMA_API bool llama_context_recurrent_expand(struct llama_context * ctx, uint32_t new_n_seq_max);
     LLAMA_API bool llama_context_recurrent_shrink(struct llama_context * ctx, uint32_t new_n_seq_max);
+    // Discard any saved recurrent checkpoint. Used after loading state from
+    // prompt cache to prevent expand() from overwriting it with stale data.
+    LLAMA_API void llama_context_recurrent_clear_checkpoint(struct llama_context * ctx);
 
     //
     // State / sessions

@@ -221,7 +221,13 @@ struct server_slot {
         GGML_ASSERT(prompt.data.size() == 0);
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        // Attempt to save only the recurrent portion of the draft state via
+        // PARTIAL_ONLY.  Note: for models where the draft context is a plain
+        // KV cache (e.g. Qwen3.6 MTP), llama_kv_cache::state_write ignores
+        // this flag and saves the full KV cache.  This is functionally safe —
+        // the common-prefix portion is valid (same tokens), and the divergent
+        // suffix is removed by common_context_seq_rm during prompt processing.
+        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -235,7 +241,7 @@ struct server_slot {
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
 
         return true;
@@ -262,6 +268,11 @@ struct server_slot {
             common_context_seq_rm(ctx_dft, id, -1, -1);
         }
 
+        // Clear context checkpoints together with the prompt.
+        // Stale checkpoints from an evicted/cleared task would
+        // otherwise be matched by the recurrent checkpoint restore on the next turn,
+        // restoring recurrent state from a different conversation.
+        prompt.checkpoints.clear();
         prompt.tokens.clear();
     }
 
@@ -1612,19 +1623,20 @@ private:
     }
 
     // Expand recurrent state back after prompt cache save/load completes.
-    void recurrent_expand_after_prompt_cache() {
+    bool recurrent_expand_after_prompt_cache() {
         if (!needs_reeval) {
-            return;
+            return true;
         }
 
         // Expand to n_parallel_user cells (the original allocation from model init).
         // Context checkpoints will be re-created after this, referencing the new cells.
         if (llama_context_recurrent_expand(ctx_tgt, n_parallel_user)) {
             SRV_INF("expanded recurrent state to %d cells after prompt cache\n", n_parallel_user);
-            return;
+            return true;
         }
 
         SRV_ERR("failed to expand recurrent state (%s)\n", "prompt cache");
+        return false;
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -1735,8 +1747,31 @@ private:
                     ret->prompt_clear(false);
                 }
 
+                // Prompt cache entries carry checkpoints from a prior conversation.
+                // Their recurrent + draft state (data_tgt / data_dft, saved with
+                // PARTIAL_ONLY) encodes a different conversation's semantic content.
+                //
+                // Rather than discarding all of them here (which also discards the
+                // valid ones created during the common-prefix portion of the previous
+                // prompt), we defer the cleanup to SLOT_STATE_STARTED where n_past is
+                // known.  There, only checkpoints with pos_max > n_past are cleared
+                // (those encode the diverged suffix and are truly invalid).
+                //
+                // This preserves checkpoints from the common-prefix portion of the prompt,
+                // so the recurrent state can be restored from the most recent valid
+                // checkpoint during SLOT_STATE_STARTED, eliminating the per-turn warmup.
+
+                // Clear the recurrent checkpoint so that expand() doesn't overwrite
+                // the state with stale data from before the cache update.
+                // This is needed because the checkpoint was saved before the cache
+                // operation, and the cache operation (load or clear) has invalidated it.
+                llama_context_recurrent_clear_checkpoint(ctx_tgt);
+
                 prompt_cache->update();
-                recurrent_expand_after_prompt_cache();
+                if (!recurrent_expand_after_prompt_cache()) {
+                    SRV_ERR("%s", "recurrent expand failed after prompt cache update\n");
+                    return nullptr;
+                }
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2104,7 +2139,12 @@ private:
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
-        send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
+        // slot.task may be null if the slot was released mid-processing
+        // (e.g. after a speculative decode failure cascaded into an abort).
+        send_error(slot.task ? slot.task->id : -1,
+                   error, type,
+                   slot.task ? slot.task->n_tokens() : 0,
+                   slot.n_ctx);
     }
 
     void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
@@ -3294,6 +3334,15 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
+                            // Save the prefix-match boundary before any checkpoint
+                            // restore adjusts n_past/pos_next downward.  The checkpoint
+                            // erasure below erases entries with pos_max > pos_next, but
+                            // pos_next may have been reduced by the recurrent checkpoint
+                            // restore (or the standard checkpoint path).  This floor
+                            // prevents over-erasing checkpoints that the prefix filter
+                            // above deliberately kept (pos_max <= n_past = common prefix).
+                            const int32_t n_past_prefix = n_past;
+
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
@@ -3350,7 +3399,110 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // --- Prune checkpoints from a prior conversation ---
+                                //
+                                // Prompt cache entries carry checkpoints from the previous
+                                // conversation.  Those with pos_max <= n_past were created
+                                // during the common-prefix portion of the prompt and hold
+                                // valid recurrent state.  Those with pos_max > n_past were
+                                // created after the prefix diverges and encode a different
+                                // conversation — discard only those.
+                                {
+                                    for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                        if (it->pos_max > n_past) {
+                                            it = slot.prompt.checkpoints.erase(it);
+                                        } else {
+                                            ++it;
+                                        }
+                                    }
+                                }
+
+                                bool recurrent_state_restored = false;
+
+                                // --- Recurrent/hybrid models: restore recurrent state from checkpoint ---
+                                //
+                                // For recurrent/hybrid models (Qwen3.6, Mamba, RWKV, etc.),
+                                // the pos_min vs pos_min_thold guard is designed for SWA
+                                // models and never passes when n_swa == 0 (pos_min ≈ 0 <
+                                // pos_min_thold ≈ pos_next).
+                                //
+                                // Without this bypass the attention cache is correctly reused
+                                // via prefix matching, but the recurrent state is at the
+                                // previous conversation's end position — seq_rm rollback
+                                // fails (gap >> n_rs_seq) → cell_zero zeroes it → warmup.
+                                //
+                                // The checkpoint already holds valid recurrent state at its
+                                // pos_max.  Restoring it with PARTIAL_ONLY keeps the
+                                // attention cache intact while giving the recurrent layers a
+                                // correct starting point — eliminating the warmup gap.
+                                //
+                                // We search for the checkpoint whose pos_max is closest to
+                                // (but not after) pos_next, then restore ONLY the recurrent
+                                // state.  This bypass is only needed for models where the
+                                // standard checkpoint path never fires (n_swa == 0).
+                                // ISWA-hybrid models (n_swa > 0) are handled by the standard
+                                // path below, which already performs equivalent restore.
+                            if (needs_reeval && n_swa == 0 && !slot.prompt.checkpoints.empty()) {
+                                const auto it = std::find_if(
+                                    slot.prompt.checkpoints.rbegin(),
+                                    slot.prompt.checkpoints.rend(),
+                                    [&](const auto & cur) {
+                                        return cur.pos_max <= pos_next;
+                                    }
+                                );
+
+                                if (it != slot.prompt.checkpoints.rend()) {
+                                    recurrent_state_restored = true;
+                                    const auto & ckpt = *it;
+
+                                    ckpt.load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    ckpt.load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+
+                                    SLT_WRN(slot, "restored recurrent state from context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", pos_next = %d, size = %.3f MiB)\n",
+                                            ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, pos_next, (float) ckpt.size() / 1024 / 1024);
+
+                                    // Recurrent state is now at ckpt.pos_max (i.e. after
+                                    // processing token pos_max).  Set n_past = pos_max + 1
+                                    // so the normal prompt-processing loop starts from the
+                                    // first UNPROCESSED token.  This avoids KV cache
+                                    // fragmentation and—crucially—prevents a vacuous seq_rm
+                                    // rollback: p0 = pos_next() = pos_max + 1 > cell.pos,
+                                    // so the cell survives untouched, eliminating the 1-position
+                                    // metadata deviation between cell.pos and the R/S tensor data.
+                                    //
+                                    // NOTE: has_new_tokens and pos_min_thold were computed from
+                                    // the pre-adjustment n_past and are never consumed for
+                                    // n_swa == 0 (pos_min ≥ pos_min_thold is always false).
+                                    n_past   = ckpt.pos_max + 1;
+                                    pos_next = slot.prompt.tokens.pos_next(n_past);
+                                    SLT_WRN(slot, "adjusted n_past to checkpoint pos_max + 1 (%d): %d tokens will be re-evaluated by normal prompt loop\n",
+                                            (int)(ckpt.pos_max + 1), (int)(pos_next - n_past));
+                                }
+                            }
+                            // --- end recurrent checkpoint bypass ---
+
+                            // --- Fallback: recurrent state not restored, force full reprocessing ---
+                            //
+                            // The checkpoint-based restore above is the sole recurrent
+                            // state recovery path for n_swa == 0 hybrid models.  If it
+                            // did not run (no suitable checkpoint survived filtering),
+                            // the recurrent state is at the previous conversation's end —
+                            // seq_rm rollback will fail (gap >> n_rs_seq) → cell_zero →
+                            // warmup (degraded quality for the first few hundred tokens,
+                            // which then feed back into the attention cache).
+                            //
+                            // Rather than accept warmup, force full prompt reprocessing.
+                            // This follows the same do_reset pattern as the standard
+                            // checkpoint path — semantically correct, just slower.
+                            if (needs_reeval && n_swa == 0 && n_past > 0 && !recurrent_state_restored) {
+                                SLT_WRN(slot, "%s", "no suitable checkpoint for recurrent state recovery — "
+                                                       "forcing full prompt reprocessing to avoid warmup\n");
+                                pos_next = 0;
+                                n_past   = 0;
+                            }
+
+                            if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3391,10 +3543,18 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // Erase checkpoints that are invalidated by the
+                                // (possibly adjusted) pos_next.  The floor at
+                                // n_past_prefix prevents over-erasure: the recurrent
+                                // checkpoint restore and the standard checkpoint path
+                                // may lower pos_next, but checkpoints with pos_max
+                                // between the lowered pos_next and n_past_prefix were
+                                // deliberately kept by the prefix filter above (they
+                                // encode valid common-prefix recurrent state).
+                                const auto pos_floor = std::max(pos_next, (llama_pos) n_past_prefix);
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    if (cur.pos_max > pos_floor) {
                                         SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
@@ -3414,6 +3574,9 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
+                        // Defensive: if prompt_load restored fewer tokens than n_past
+                        // (e.g. cache eviction trimmed the entry), clamp n_past to fit.
+                        n_past = std::min(n_past, (int32_t) slot.prompt.tokens.size());
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing
@@ -3734,6 +3897,12 @@ private:
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
+
+            // Clear stale speculative batch indices so post_decode
+            // validation does not fail on the retry with a smaller batch.
+            if (slot_batched) {
+                slot_batched->spec_i_batch.clear();
+            }
 
             return false; // retry with the updated n_batch
         }

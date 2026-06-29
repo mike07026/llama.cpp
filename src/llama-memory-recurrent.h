@@ -65,6 +65,28 @@ public:
     bool expand(uint32_t new_mem_size);
     bool shrink(uint32_t new_mem_size);
 
+    // Get the tail cell index for a given sequence.
+    // Returns -1 if the sequence has no valid cell.
+    int32_t get_cell_tail(llama_seq_id seq_id) const;
+
+    // Zero out R/S tensor data (all rows including rollback snapshots)
+    // for a specific cell, and reset its rollback index.
+    // This is used when recurrent state becomes stale (e.g., after partial
+    // seq_rm failure) to avoid warmup effects from stale data.
+    void cell_zero(llama_seq_id seq_id);
+
+    // Zero only the snapshot rows (rows 1..n_rs_seq) of a specific cell,
+    // leaving the primary row (row 0) untouched.  Used in find_slot when a
+    // cell is freshly allocated and its primary row will be populated by
+    // s_copy, but snapshot rows may contain stale data from a previous
+    // sequence that must not be read via a subsequent rs_idx rollback.
+    void cell_zero_snapshots(uint32_t cell_idx);
+
+    // Copy the primary row of a specific cell to all its snapshot rows.
+    // Used after state_read (checkpoint restore) to ensure snapshot planes
+    // contain valid data rather than stale remnants from a prior sequence.
+    void cell_copy_primary_to_snapshots(uint32_t cell_idx);
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -81,6 +103,41 @@ public:
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    //
+    // Recurrent state checkpoint for shrink/expand round-trip safety.
+    // When shrink() discards cells beyond the new size, their R/S tensor
+    // data and cell metadata would be lost.  save_checkpoint() captures
+    // all active cells' state before shrink; restore_checkpoint() replays
+    // it after expand so recurrent state remains consistent with the
+    // pre-shrink state, eliminating warmup deviation.
+    //
+
+    struct recr_checkpoint_cell {
+        uint32_t cell_idx = 0;
+        llama_pos pos = -1;
+        int32_t src = -1;
+        int32_t src0 = -1;
+        int32_t tail = -1;
+        std::set<llama_seq_id> seq_id;
+        // R/S tensor data for all rows of this cell (primary + n_rs_seq snapshots)
+        std::vector<uint8_t> r_data;
+        std::vector<uint8_t> s_data;
+    };
+
+    // Snapshot of all active cells taken before shrink.
+    std::vector<recr_checkpoint_cell> recr_checkpoint_cells;
+    // Number of rows per-cell in the tensor at snapshot time (1 + n_rs_seq then).
+    uint32_t recr_checkpoint_rows_per_cell = 0;
+
+    // Save R/S tensor data and cell metadata for every active cell.
+    void save_checkpoint();
+    // Restore saved cell metadata and R/S tensor data.
+    void restore_checkpoint();
+    // Discard saved checkpoint data. Used when prompt cache has already
+    // loaded the correct recurrent state, so restore_checkpoint() would
+    // overwrite it with stale data from before the cache update.
+    void clear_checkpoint();
 
     // computed before each graph build
     uint32_t n = 0;

@@ -120,6 +120,7 @@ struct llama_context {
     void set_warmup(bool value);
 
     bool resize_recurrent_memory(uint32_t new_n_seq_max, bool expand);
+    void clear_recurrent_checkpoint();
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 

@@ -3994,6 +3994,32 @@ bool llama_context_recurrent_shrink(llama_context * ctx, uint32_t new_n_seq_max)
     return ctx ? ctx->resize_recurrent_memory(new_n_seq_max, false) : false;
 }
 
+void llama_context::clear_recurrent_checkpoint() {
+    if (!memory) return;
+
+    auto * recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    if (!recr) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (hybrid) {
+            recr = hybrid->get_mem_recr();
+        } else {
+            auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get());
+            if (hybrid_iswa) {
+                recr = hybrid_iswa->get_mem_recr();
+            }
+        }
+    }
+    if (recr) {
+        recr->clear_checkpoint();
+    }
+}
+
+void llama_context_recurrent_clear_checkpoint(llama_context * ctx) {
+    if (ctx) {
+        ctx->clear_recurrent_checkpoint();
+    }
+}
+
 // llama state API
 
 // deprecated

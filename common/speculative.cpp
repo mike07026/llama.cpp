@@ -1029,6 +1029,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // Zero the cross-batch carry-over vector.  Without this, the last
+        // h_nextn row from a previous conversation leaks into the first
+        // process() call of the new conversation, giving the draft model a
+        // stale initial embedding that biases drafts toward the old topic.
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
