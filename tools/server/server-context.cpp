@@ -3766,21 +3766,31 @@ private:
                     const int32_t n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
                     {
-                        const bool is_on_user =
-                            n_before_user_known &&
-                            n_tokens_start == n_before_user;
+                        // Upstream limits checkpoints to user-message boundaries
+                        // (PR #24176) to keep full-KV checkpoint size manageable
+                        // for SWA models.  Recurrent/hybrid models save only
+                        // recurrent state via PARTIAL_ONLY — allow both
+                        // evenly-spaced checkpoints (per checkpoint_min_step)
+                        // and one at the last user message boundary, so the
+                        // recurrent state can be restored from a position close
+                        // to any prefix-match point.
+                        if (!needs_reeval) {
+                            const bool is_on_user =
+                                n_before_user_known &&
+                                n_tokens_start == n_before_user;
 
-                        const bool is_after_user =
-                            n_before_user_known &&
-                            n_tokens_start > n_before_user;
+                            const bool is_after_user =
+                                n_before_user_known &&
+                                n_tokens_start > n_before_user;
 
-                        const bool is_allowed =
-                            !n_before_user_known ||
-                            is_on_user ||
-                            (is_after_user && near_prompt_end);
+                            const bool is_allowed =
+                                !n_before_user_known ||
+                                is_on_user ||
+                                (is_after_user && near_prompt_end);
 
-                        if (do_checkpoint && !is_allowed) {
-                            do_checkpoint = false;
+                            if (do_checkpoint && !is_allowed) {
+                                do_checkpoint = false;
+                            }
                         }
                     }
 
@@ -3793,8 +3803,39 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    // ── Recurrent/hybrid model checkpoint strategy ──
+                    //
+                    //   [anchor] ... ... [tracking]   ← tracking moves forward
+                    //                               ← distance grows each turn
+                    //   When tracking ≥ min_step from anchor → freeze it,
+                    //   start a new tracking point.  Otherwise keep sliding.
+                    if (needs_reeval) {
+                        const int64_t min_step = params_base.checkpoint_min_step;
+                        const size_t  n        = slot.prompt.checkpoints.size();
+
+                        if (n >= 2) {
+                            // Reference: second-to-last checkpoint (anchor).
+                            // Only push() changes it, so distance accumulates
+                            // across turns naturally.
+                            auto       ri  = slot.prompt.checkpoints.rbegin();
+                            const auto ref = (++ri)->n_tokens;
+
+                            const int64_t d1 = n_tokens_start - ref;
+                            const int64_t d2 =
+                                slot.prompt.checkpoints.back().n_tokens - ref;
+
+                            if (d1 < min_step && d2 < min_step) {
+                                // Still too close — replace back() in-place.
+                                auto & cur = slot.prompt.checkpoints.back();
+                                cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+                                cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                if (ctx_dft) cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+                                do_checkpoint = false;  // skip normal creation
+                            }
+                        }
+                        // n ≤ 1, or far enough: fall through to create_checkpoint
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
