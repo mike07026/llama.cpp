@@ -600,6 +600,25 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         (size_t) mem_size * row_size,
         (size_t) kv_head * row_size);
 
+    // Shift historical snapshot slots before GDN writes to slot_0.
+    // During decode (n_seq_tokens=1) the kernel only fills slot_0,
+    // leaving slots 1..K-1 with stale prefill data.  Shift them right
+    // as a shift register so slot_k holds the state from k steps ago.
+    // Must execute BEFORE the gdn_out copy so the old slot_0 is preserved.
+    if (n_seq_tokens == 1 && K > 1) {
+        for (int64_t slot = K - 1; slot >= 1; --slot) {
+            ggml_tensor * shift_src = ggml_view_2d(ctx0, ssm_states_all,
+                hparams.n_embd_s(), n_seqs,
+                ssm_states_all->nb[1],
+                ((slot - 1) * (int64_t) mem_size + kv_head) * row_size);
+            ggml_tensor * shift_dst = ggml_view_2d(ctx0, ssm_states_all,
+                hparams.n_embd_s(), n_seqs,
+                ssm_states_all->nb[1],
+                (slot * (int64_t) mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, shift_src, shift_dst));
+        }
+    }
+
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
     return output;
