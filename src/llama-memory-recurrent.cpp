@@ -490,13 +490,15 @@ void llama_memory_recurrent::cell_zero(llama_seq_id seq_id) {
     // Clearing seq_id makes the cell genuinely empty and findable by the
     // empty-cell scan without breaking any other code path:
     //   - resize() tail recovery runs before any cell_zero call;
-    //   - cell theft by another seq is not a concern because tail is already
-    //     -1 — find_slot will go through the fresh-allocation path and
-    //     rebuild ownership from scratch.
+    //   - cell theft by another seq is not a concern because the cell is
+    //     now genuinely empty — find_slot will go through the fresh-
+    //     allocation path and rebuild ownership from scratch.
     cells[cell_idx].seq_id.clear();
     cells[cell_idx].pos = -1;
     cells[cell_idx].src = -1;
     cells[cell_idx].src0 = -1;
+
+    cells[seq_id].tail = -1;
 
     // Reset rollback index so find_slot uses zero initialization
     set_rs_idx(seq_id, 0);
