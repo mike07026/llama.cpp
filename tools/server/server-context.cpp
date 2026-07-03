@@ -171,6 +171,7 @@ struct server_slot {
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
+    std::vector<float>   spec_draft_probs;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
@@ -321,6 +322,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_probs.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3066,14 +3068,16 @@ private:
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        slot.spec_draft_probs.clear();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting   = */ true,
+                            /* .n_max      = */ n_draft_max,
+                            /* .n_past     = */ slot.prompt.n_tokens(),
+                            /* .id_last    = */ slot.sampled,
+                            /* .prompt     = */ &slot.spec_prompt,
+                            /* .result     = */ &slot.spec_draft,
+                            /* .draft_probs= */ &slot.spec_draft_probs,
                         };
 
                         drafting.push_back(&slot);
@@ -4099,13 +4103,23 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
-            // verify and try to accept the draft
+            // Token-matching speculative verification on a throwaway clone.
+            // The clone runs the full sampler chain (including dist RNG,
+            // penalties, reasoning budget) and is discarded afterward.
+            // The original slot.smpl state is NOT mutated during
+            // verification — only after committed tokens are replayed.
             {
-                // save the sampler sampler state in case we need to restore it
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
-
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+                const bool has_probs = slot.spec_draft_probs.size() == n_draft;
+                auto accepted = common_sampler_sample_and_accept_n_prob(
+                        slot.smpl.get(),
+                        slot.ctx_tgt,
+                        slot.spec_i_batch,
+                        slot.spec_draft,
+                        has_probs ? &slot.spec_draft_probs : nullptr,
+                        common_sampler_get_seed(slot.smpl.get()));
+
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4125,6 +4139,11 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_draft = std::move(accepted);
+                        // accepted includes the bonus/recovery token which has no draft prob entry.
+                        // keep only the entries that correspond to actual draft positions.
+                        if (slot.spec_draft_probs.size() > slot.spec_draft.size() - 1) {
+                            slot.spec_draft_probs.resize(slot.spec_draft.size() - 1);
+                        }
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -4143,9 +4162,34 @@ private:
                         }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        slot.smpl = std::move(smpl_save);
 
                         return;
+                    }
+                }
+
+                // Replay committed tokens into the original sampler.
+                // The throwaway clone consumed RNG draws and mutated its
+                // own penalty/reasoning-budget state during verification;
+                // we replay only the committed tokens on the original to
+                // advance the original's penalty/repetition state.
+                for (size_t j = 0; j < accepted.size(); j++) {
+                    common_sampler_accept(slot.smpl.get(), accepted[j], true);
+                }
+
+                // Advance the dist sampler's RNG by accepted.size() draws
+                // to match the MTP-off RNG position (one draw per decoded
+                // token).  The probabilistic verify function uses its own
+                // RNG, so the main sampler's RNG is still at the pre-verify
+                // position after accept().
+                {
+                    auto * chain = common_sampler_get(slot.smpl.get());
+                    llama_token_data dummy[2] = {{0, 0.0f, 0.0f}, {1, 0.0f, 0.0f}};
+                    llama_token_data_array dummy_arr = {dummy, 2, 0, false};
+                    for (size_t j = 0; j < accepted.size(); j++) {
+                        dummy_arr.data[0].logit = 1.0f;
+                        dummy_arr.data[1].logit = 0.0f;
+                        dummy_arr.selected = -1;
+                        llama_sampler_apply(chain, &dummy_arr);
                     }
                 }
 
@@ -4156,6 +4200,13 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                // Keep spec_draft_probs aligned: the accepted tokens include
+                // draft tokens (which have probs) and possibly a bonus token
+                // (which has no prob — the last element of accepted is the
+                // bonus or recovered token, not a draft).
+                if (slot.spec_draft_probs.size() > slot.spec_draft.size() - 1) {
+                    slot.spec_draft_probs.resize(slot.spec_draft.size() - 1);
+                }
             }
 
             const int64_t t_now = ggml_time_us();

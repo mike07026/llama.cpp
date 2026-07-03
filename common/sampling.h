@@ -85,6 +85,34 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// Probabilistic speculative verification (Leviathan et al. 2022).
+//
+// Standard rejection sampling: for each draft token x_i at batch position
+// idxs[i], sample r ~ Uniform(0,1), compute target probability p_t(x_i)
+// from the target model's logits after softmax, and accept x_i if
+// r < min(1, p_t(x_i) / q_d(x_i)).
+//
+// draft_probs is an optional per-draft probability array.  When nullptr,
+// the acceptance test degenerates to r < p_t(x_i) (conservative, always
+// correct — equivalent to Leviathan's "no draft distribution" variant).
+//
+// On rejection, the recovered token is sampled from the target
+// distribution p_t (a target-only resample).  If all drafts are accepted,
+// a bonus token is sampled from p_t at idxs[draft.size()].
+//
+// The sampler state (penalties, grammar, reasoning budget) is NOT
+// mutated by this function.  The caller is responsible for accepting
+// the returned committed tokens into the real sampler chain.
+//
+// Returns at least 1 token, up to idxs.size().
+std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<float> * draft_probs = nullptr,
+        uint32_t seed = LLAMA_DEFAULT_SEED);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
