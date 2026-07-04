@@ -4110,9 +4110,9 @@ private:
             LOG_INF("[SPEC_CYCLE] slot=%d n_draft=%zu n_decoded=%d\n",
                     slot.id, n_draft, slot.n_decoded);
 
-            // Token-matching speculative verification on a throwaway clone.
-            // The clone runs the full sampler chain (including dist RNG,
-            // penalties, reasoning budget) and is discarded afterward.
+            // Leviathan probabilistic verification on a throwaway clone.
+            // Uses private RNG for acceptance draws; target dist RNG is
+            // only consumed for recovery/bonus sampling on the clone.
             // The original slot.smpl state is NOT mutated during
             // verification — only after committed tokens are replayed.
             {
