@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <random>
 
 #ifdef LLAMA_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
@@ -1336,6 +1337,14 @@ extern "C" {
 
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
+
+    /// Get the internal Mersenne Twister RNG of a dist sampler.
+    /// Returns NULL if the sampler is not a dist sampler.
+    LLAMA_API std::mt19937 * llama_sampler_dist_get_rng(struct llama_sampler * smpl);
+
+    /// Get the temperature value from a temp sampler.
+    /// Returns 1.0f if the sampler is not a temperature sampler.
+    LLAMA_API float llama_sampler_temp_get(const struct llama_sampler * smpl);
 
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop

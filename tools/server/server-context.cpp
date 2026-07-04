@@ -2071,7 +2071,11 @@ private:
             slot.stop           = STOP_TYPE_EOS;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "%s", "stopped by EOS\n");
+            LOG_WRN("[PROCESS_TOKEN] *** EOS STOP *** slot=%d n_decoded=%d tok=%d '%s' last_text='%s'\n",
+                    slot.id, slot.n_decoded, result.tok, token_str.c_str(),
+                    slot.generated_text.size() > 200
+                        ? slot.generated_text.substr(slot.generated_text.size() - 200).c_str()
+                        : slot.generated_text.c_str());
         }
 
         SLT_DBG(slot, "n_decoded = %d, n_remaining = %d, next token: %5d '%s'\n", slot.n_decoded, slot.n_remaining, result.tok, token_str.c_str());
@@ -4103,6 +4107,9 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            LOG_INF("[SPEC_CYCLE] slot=%d n_draft=%zu n_decoded=%d\n",
+                    slot.id, n_draft, slot.n_decoded);
+
             // Token-matching speculative verification on a throwaway clone.
             // The clone runs the full sampler chain (including dist RNG,
             // penalties, reasoning budget) and is discarded afterward.
@@ -4125,6 +4132,31 @@ private:
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+
+                // Trace verification results: which drafts matched, and
+                // whether any accepted token is EOS.
+                {
+                    for (size_t j = 0; j < accepted.size(); j++) {
+                        bool is_eos = llama_vocab_is_eog(vocab, accepted[j]);
+                        bool is_draft = j < slot.spec_draft.size() && accepted[j] == slot.spec_draft[j];
+                        LOG_INF("[SPEC_VERIFY] slot=%d pos=%zu/%zu tok=%d '%s' matched_draft=%d is_eos=%d n_rollback=%u\n",
+                                slot.id, j, accepted.size(), accepted[j],
+                                common_token_to_piece(slot.ctx_tgt, accepted[j], true).c_str(),
+                                (int)is_draft, (int)is_eos, n_rollback);
+                        if (is_eos) {
+                            LOG_WRN("[SPEC_VERIFY] *** EOS DETECTED in accepted[%zu] *** tok=%d '%s' n_decoded=%d\n",
+                                    j, accepted[j],
+                                    common_token_to_piece(slot.ctx_tgt, accepted[j], true).c_str(),
+                                    slot.n_decoded);
+                        }
+                    }
+                    // Also log what the drafts were for comparison.
+                    for (size_t j = 0; j < slot.spec_draft.size(); j++) {
+                        LOG_INF("[SPEC_DRAFT] slot=%d draft[%zu]=%d '%s'\n",
+                                slot.id, j, slot.spec_draft[j],
+                                common_token_to_piece(slot.ctx_tgt, slot.spec_draft[j], true).c_str());
+                    }
+                }
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||

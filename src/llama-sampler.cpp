@@ -1241,6 +1241,23 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
+std::mt19937 * llama_sampler_dist_get_rng(struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface == nullptr) {
+        return nullptr;
+    }
+    // Check the CPU-side interface (the sampler might not be a dist sampler).
+    if (smpl->iface->name == nullptr) {
+        return nullptr;
+    }
+    const char * name = smpl->iface->name(smpl);
+    // Backend init may have prepended "+"/"-", so check substring.
+    if (strstr(name, "dist") == nullptr) {
+        return nullptr;
+    }
+    auto * ctx = (llama_sampler_dist *) smpl->ctx;
+    return &ctx->rng;
+}
+
 // top-k
 
 struct llama_sampler_top_k : public llama_sampler_backend {
@@ -1798,6 +1815,21 @@ struct llama_sampler * llama_sampler_init_typical(float p, size_t min_keep) {
 struct llama_sampler_temp : public llama_sampler_backend {
     const float temp;
 };
+
+float llama_sampler_temp_get(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface == nullptr || smpl->iface->name == nullptr) {
+        return 1.0f;
+    }
+    const char * name = smpl->iface->name(smpl);
+    // temp=1.0 is replaced with an empty sampler ("?temp"), which has
+    // a null ctx.  Only match the real temp sampler (name is "temp",
+    // possibly with "+"/"-" backend prefix).
+    if (strstr(name, "temp") == nullptr || name[0] == '?') {
+        return 1.0f;
+    }
+    auto * ctx = (const llama_sampler_temp *) smpl->ctx;
+    return ctx->temp;
+}
 
 static const char * llama_sampler_temp_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_temp *) smpl->ctx;
@@ -2718,6 +2750,7 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
         auto * result_ctx = (llama_sampler_penalties *) result->ctx;
 
         result_ctx->prev = ctx->prev;
+        result_ctx->token_count = ctx->token_count;
     }
 
     return result;

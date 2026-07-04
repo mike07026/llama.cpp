@@ -327,6 +327,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 // grammar, or penalty samplers that suppress EOS during
                 // thinking blocks.  EOS must be decided by the target model.
                 if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                    LOG_INF("[EOS_GUARD draft-simple] seq_id=%d token=%d '%s' — blocked\n",
+                            seq_id, id, common_token_to_piece(ctx_dft, id).c_str());
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -792,6 +794,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 // grammar, or penalty samplers that suppress EOS during
                 // thinking blocks.  EOS must be decided by the target model.
                 if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_dft)), id)) {
+                    LOG_INF("[EOS_GUARD draft-eagle3] seq_id=%d token=%d '%s' — blocked\n",
+                            seq_id, id, common_token_to_piece(ctx_dft, id).c_str());
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1281,6 +1285,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // forward pass, biasing subsequent drafts toward EOS.
                 // EOS must be decided by the target model's full sampler chain.
                 if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(params.ctx_dft)), id)) {
+                    LOG_INF("[EOS_GUARD draft-mtp] seq_id=%d token=%d '%s' — blocked\n",
+                            seq_id, id, common_token_to_piece(params.ctx_dft, id).c_str());
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
