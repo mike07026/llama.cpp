@@ -172,6 +172,7 @@ struct server_slot {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<float>   spec_draft_probs;
+    std::vector<std::vector<llama_token_data>> spec_draft_cands;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
@@ -323,6 +324,7 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_draft_probs.clear();
+            spec_draft_cands.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3073,6 +3075,7 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
                         slot.spec_draft_probs.clear();
+                        slot.spec_draft_cands.clear();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting   = */ true,
@@ -3082,6 +3085,7 @@ private:
                             /* .prompt     = */ &slot.spec_prompt,
                             /* .result     = */ &slot.spec_draft,
                             /* .draft_probs= */ &slot.spec_draft_probs,
+                            /* .draft_cands= */ &slot.spec_draft_cands,
                         };
 
                         drafting.push_back(&slot);
@@ -4119,12 +4123,14 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
                 const bool has_probs = slot.spec_draft_probs.size() == n_draft;
+                const bool has_cands = slot.spec_draft_cands.size() == n_draft;
                 auto accepted = common_sampler_sample_and_accept_n_prob(
                         slot.smpl.get(),
                         slot.ctx_tgt,
                         slot.spec_i_batch,
                         slot.spec_draft,
                         has_probs ? &slot.spec_draft_probs : nullptr,
+                        has_cands ? &slot.spec_draft_cands : nullptr,
                         common_sampler_get_seed(slot.smpl.get()));
 
                 slot.spec_i_batch.clear();
@@ -4175,6 +4181,9 @@ private:
                         // keep only the entries that correspond to actual draft positions.
                         if (slot.spec_draft_probs.size() > slot.spec_draft.size() - 1) {
                             slot.spec_draft_probs.resize(slot.spec_draft.size() - 1);
+                        }
+                        if (slot.spec_draft_cands.size() > slot.spec_draft.size() - 1) {
+                            slot.spec_draft_cands.resize(slot.spec_draft.size() - 1);
                         }
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4247,12 +4256,16 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
-                // Keep spec_draft_probs aligned: the accepted tokens include
-                // draft tokens (which have probs) and possibly a bonus token
-                // (which has no prob — the last element of accepted is the
-                // bonus or recovered token, not a draft).
+                // Keep spec_draft_probs and spec_draft_cands aligned:
+                // the accepted tokens include draft tokens (which have
+                // probs/cands) and possibly a bonus token (which has no
+                // prob/cand — the last element of accepted is the bonus
+                // or recovered token, not a draft).
                 if (slot.spec_draft_probs.size() > slot.spec_draft.size() - 1) {
                     slot.spec_draft_probs.resize(slot.spec_draft.size() - 1);
+                }
+                if (slot.spec_draft_cands.size() > slot.spec_draft.size() - 1) {
+                    slot.spec_draft_cands.resize(slot.spec_draft.size() - 1);
                 }
             }
 

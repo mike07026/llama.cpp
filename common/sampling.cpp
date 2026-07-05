@@ -777,11 +777,9 @@ static llama_token spec_eos_to_think_end(const llama_vocab * vocab, struct llama
 //   r_i ~ Uniform(0,1).  The first position where r_i > p_t[i] / p_d[i]
 //   is the rejection point.  All tokens before that point are accepted.
 //
-//   Phase 4 — Recovery.  The rejected draft token is zeroed from the
-//   raw full-vocab logits, and a replacement token is sampled from
-//   the resulting distribution via the sampler chain.  (Approximation:
-//   zeros only the selected draft token rather than subtracting the
-//   full draft distribution q_d.)
+//   Phase 4 — Recovery.  When draft_cands is available, computes the
+//   exact residual distribution norm(max(0, p_t - q_d)).  Otherwise
+//   falls back to zeroing the single rejected draft token.
 //
 //   Bonus token: sampled from the raw full-vocab logits via the full
 //   sampler chain (identical to MTP-OFF for q_d=1.0).
@@ -791,6 +789,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         const std::vector<int> & idxs,
         const llama_tokens & draft,
         const std::vector<float> * draft_probs,
+        const std::vector<std::vector<llama_token_data>> * draft_cands,
         uint32_t /*seed*/) {
 
     GGML_ASSERT(idxs.size() == draft.size() + 1);
@@ -810,14 +809,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
     std::uniform_real_distribution<double> uniform01(0.0, 1.0);
 
     // ============================================================
-    // Phase 1: Precompute p_t[i] from raw full-vocab logits.
-    //
-    // We also check for -INF (suppressed by rbudget or grammar).
-    // If any draft position is suppressed, we bail out immediately.
+    // Phase 1+2 (fused): For each draft position, check suppression,
+    // compute p_t lazily, and test acceptance — stopping at the first
+    // rejection.  Softmax is only computed for positions that survive
+    // the suppression check, saving CPU when drafts are rejected early.
     // ============================================================
     const size_t n_draft = draft.size();
     std::vector<float> p_t_arr(n_draft, 0.0f);
-    size_t first_suppressed = (size_t)-1; // ~0
+    size_t accept_len = 0;
+    bool   bailout_early = false;
 
     for (size_t i = 0; i < n_draft; i++) {
         const llama_token draft_token = draft[i];
@@ -827,7 +827,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
 
         const float * raw_logits = llama_get_logits_ith(ctx, idxs[i]);
 
-        // Compute p_t(x_draft) via full-vocab softmax.
+        // Compute p_t(draft_token) via full-vocab softmax FIRST —
+        // must use unmodified logits (before rbudget/grammar application).
+        float p_t_i = 0.0f;
         {
             const bool use_raw = (raw_logits != nullptr && (int)cur.size != n_vocab_full);
 
@@ -843,7 +845,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                     if (j == (int)draft_token) pn = p;
                     sm += p;
                 }
-                if (sm > 0.0) p_t_arr[i] = pn / (float)sm;
+                if (sm > 0.0) p_t_i = pn / (float)sm;
             } else {
                 float mx = -INFINITY;
                 for (size_t j = 0; j < cur.size; j++) {
@@ -856,16 +858,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                     if (cur.data[j].id == draft_token) pn = p;
                     sm += p;
                 }
-                if (sm > 0.0) p_t_arr[i] = pn / (float)sm;
+                if (sm > 0.0) p_t_i = pn / (float)sm;
             }
         }
+        p_t_arr[i] = p_t_i;
 
-        LOG_DBG("[PROB_ACCEPT] i=%zu draft=%d '%s' p_t=%.6f cur_size=%zu\n",
-                i, draft_token,
-                common_token_to_piece(vocab, draft_token, false).c_str(),
-                p_t_arr[i], cur.size);
-
-        // Check -INF suppression (rbudget or grammar).
+        // Check -INF suppression (rbudget or grammar) AFTER p_t computation —
+        // a suppressed draft token cannot be accepted regardless of p_t.
         {
             llama_sampler_apply(smpl_tmp->rbudget, &cur);
             if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
@@ -876,44 +875,40 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 if (cur.data[j].id == draft_token) { p_logit = cur.data[j].logit; break; }
             }
             if (p_logit == -INFINITY) {
-                first_suppressed = i;
-                p_t_arr[i] = 0.0f; // force rejection
+                p_t_arr[i] = 0.0f;
+                bailout_early = true;
+                break;
             }
         }
-    }
 
-    // ============================================================
-    // Phase 2: Block verification — find first rejected position.
-    //
-    // For each position i, draw r_i ~ Uniform(0,1).
-    // Accept if r_i < p_t[i] / p_d[i], where p_d[i] is the draft model's
-    // probability of draft token i (from draft_probs, if available).
-    // Falls back to p_d = 1.0 (conservative) when draft_probs is null.
-    // ============================================================
-    size_t accept_len = 0;
-    for (size_t i = 0; i < n_draft; i++) {
+        LOG_DBG("[PROB_ACCEPT] i=%zu draft=%d '%s' p_t=%.6f cur_size=%zu\n",
+                i, draft_token,
+                common_token_to_piece(vocab, draft_token, false).c_str(),
+                p_t_i, cur.size);
+
+        // Block verification: accept if r < p_t / p_d.
         const double r   = uniform01(accept_rng);
         const double p_d = draft_probs ? (double)(*draft_probs)[i] : 1.0;
-        const double threshold = (p_d > 0.0) ? (double)p_t_arr[i] / p_d : 0.0;
+        const double threshold = (p_d > 0.0) ? (double)p_t_i / p_d : 0.0;
+
         if (r < threshold) {
             accept_len = i + 1;
             LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f p_d=%.6f t=%.6f -> ACCEPT, accept_len=%zu\n",
-                    i, r, p_t_arr[i], p_d, threshold, accept_len);
+                    i, r, p_t_i, p_d, threshold, accept_len);
         } else {
             LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f p_d=%.6f t=%.6f -> REJECT (first), accept_len=%zu\n",
-                    i, r, p_t_arr[i], p_d, threshold, accept_len);
+                    i, r, p_t_i, p_d, threshold, accept_len);
             break;
         }
     }
 
     // Summary: how many drafts were accepted this cycle.
-    LOG_DBG("[PROB_ACCEPT] accept_len=%zu/%zu suppressed_at=%zu"
+    LOG_DBG("[PROB_ACCEPT] accept_len=%zu/%zu bailout_early=%d"
             " p_t=[%s]\n",
-            accept_len, n_draft,
-            first_suppressed < n_draft ? first_suppressed : (size_t)-1,
+            accept_len, n_draft, (int)bailout_early,
             [&]() {
                 std::string s;
-                for (size_t k = 0; k < n_draft; k++) {
+                for (size_t k = 0; k < accept_len; k++) {
                     char buf[32];
                     snprintf(buf, sizeof(buf), "%s%.4f", k ? "," : "", p_t_arr[k]);
                     s += buf;
@@ -925,28 +920,102 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
     // Phase 3: Output accepted tokens and handle first rejection.
     // ============================================================
     // Helper: sample a token from raw logits (not chain-filtered)
-    // at a given idx, with the draft token zeroed.
-    auto sample_recovery = [&](int idx, llama_token rejected_draft) -> llama_token {
+    // at a given idx.  When draft_cands is available at rej_i,
+    // computes the exact recovery distribution norm(max(0, p_t - q_d))
+    // where q_d is the draft model's full candidate distribution.
+    // Otherwise falls back to zeroing the single rejected draft token.
+
+    // empty placeholder for when draft_cands is null
+    static const std::vector<llama_token_data> empty_cands;
+
+    auto sample_recovery = [&](int idx, llama_token rejected_draft, size_t rej_i) -> llama_token {
         const float * raw = llama_get_logits_ith(ctx, idx);
 
-        // Copy raw logits into cur, zeroing the rejected draft.
         smpl_tmp->set_logits(ctx, idx);
         auto & cur = smpl_tmp->cur_p;
 
-        if (raw != nullptr && (int)cur.size != n_vocab_full) {
-            // Need to rebuild from raw — cur has filtered candidates.
-            // Zero the draft in raw space, then run the chain.
-            // We temporarily modify raw logits via the context API to
-            // feed our zeroed version through the sampler chain.
+        const bool have_cands = draft_cands && rej_i < draft_cands->size();
+        const auto & q_d = have_cands ? (*draft_cands)[rej_i]
+                                      : (const std::vector<llama_token_data> &) empty_cands;
+
+        if (have_cands && !q_d.empty() && raw != nullptr && (int)cur.size != n_vocab_full) {
+            // ==========================================================
+            // EXACT RECOVERY: norm(max(0, p_t - q_d))
             //
-            // Since we can't mutate the context's logits, we instead
-            // build the full-vocab candidate array ourselves, apply the
-            // chain filters, and sample.
+            // p_t(j) = softmax(raw_logits)[j]  (full-vocab)
+            // q_d(j)  = draft model prob of token j (0 for most tokens)
+            // residual(j) = max(0, p_t(j) - q_d(j))
+            // Convert back to logits for the sampler chain.
             //
-            // Build a full-vocab candidate array from raw logits,
-            // zeroing the rejected draft.  Then update cur_p to
-            // point to it so the sampler chain operates on the full
-            // vocabulary (needed for correct top_p / min_p statistics).
+            // Two-pass algorithm:
+            //   Pass 1: compute max logit for numerical stability.
+            //   Pass 2: compute Z_t AND cache exp(raw[j]-mx) in cur[j].logit
+            //           (reused in pass 3 to avoid recomputing expf).
+            //   Pass 3: p_t = cached_exp / Z_t, subtract q_d, log, overwrite.
+            // ==========================================================
+
+            // Pass 1: compute max logit for numerical stability
+            float mx = -INFINITY;
+            for (int j = 0; j < n_vocab_full; j++) {
+                if (raw[j] > mx) mx = raw[j];
+            }
+
+            // Build fast lookup for q_d tokens (at most 10 entries).
+            // Use a small stack array to avoid heap allocation.
+            const size_t n_q = q_d.size();
+            GGML_ASSERT(n_q <= 16 && "draft candidate distribution too large");
+
+            llama_token q_ids[16];
+            float       q_ps [16];
+            for (size_t k = 0; k < n_q; k++) {
+                q_ids[k] = q_d[k].id;
+                q_ps [k] = q_d[k].p;
+            }
+
+            // Pass 2: compute Z_t + cache exp values in cur[j].logit.
+            // cur[j].logit temporarily holds expf(raw[j] - mx).
+            smpl_tmp->cur.resize(n_vocab_full);
+            double Z_t = 0.0;
+            for (llama_token j = 0; j < n_vocab_full; j++) {
+                float exp_val = expf(raw[j] - mx);
+                Z_t += exp_val;
+                smpl_tmp->cur[j] = llama_token_data{ j, exp_val, 0.0f };
+            }
+
+            // Pass 3: convert cached exp to p_t, subtract q_d, store logit.
+            for (llama_token j = 0; j < n_vocab_full; j++) {
+                float p_t_j = smpl_tmp->cur[j].logit / (float)Z_t;
+
+                // Subtract q_d(j) if j is in the draft distribution.
+                float p_final = p_t_j;
+                for (size_t k = 0; k < n_q; k++) {
+                    if (q_ids[k] == j) {
+                        p_final = p_t_j - q_ps[k];
+                        if (p_final < 0.0f) p_final = 0.0f;
+                        break;
+                    }
+                }
+
+                smpl_tmp->cur[j].logit = (p_final > 0.0f) ? logf(p_final) : -INFINITY;
+            }
+            cur = { smpl_tmp->cur.data(), smpl_tmp->cur.size(), -1, false };
+
+            // Apply sampler chain (skip dist — applied below).
+            llama_sampler_apply(smpl_tmp->rbudget, &cur);
+            if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
+                llama_sampler_apply(smpl_tmp->grmr, &cur);
+            }
+            for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
+                auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
+                if (llama_sampler_dist_get_rng(ch) != nullptr) continue;
+                if (strstr(llama_sampler_name(ch), "adaptive_p") != nullptr) continue;
+                llama_sampler_apply(ch, &cur);
+            }
+        } else if (raw != nullptr && (int)cur.size != n_vocab_full) {
+            // ==========================================================
+            // APPROXIMATE RECOVERY: zero only the rejected draft token.
+            // Used when draft_cands is not available.
+            // ==========================================================
             smpl_tmp->cur.resize(n_vocab_full);
             for (llama_token j = 0; j < n_vocab_full; j++) {
                 smpl_tmp->cur[j] = llama_token_data{
@@ -954,7 +1023,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
             }
             cur = { smpl_tmp->cur.data(), smpl_tmp->cur.size(), -1, false };
 
-            // Apply sampler chain (skip dist — applied below).
             llama_sampler_apply(smpl_tmp->rbudget, &cur);
             if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
                 llama_sampler_apply(smpl_tmp->grmr, &cur);
@@ -974,8 +1042,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 }
             }
 
-            // Apply chain filters (with draft zeroed, meaning the filters
-            // run over the whole vocab minus the rejected draft).
             llama_sampler_apply(smpl_tmp->rbudget, &cur);
             if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
                 llama_sampler_apply(smpl_tmp->grmr, &cur);
@@ -1004,15 +1070,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
 
         return cur.data[cur.selected].id;
     };
-
-    bool bailout_early = false;
-    if (first_suppressed < accept_len) {
-        // A draft token that was accepted by block verification was
-        // actually suppressed by rbudget/grammar.  Truncate acceptance
-        // and force recovery at that position.
-        accept_len = first_suppressed;
-        bailout_early = true;
-    }
 
     // Output accepted tokens.
     auto do_accept = [&](llama_token tok) {
@@ -1047,7 +1104,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 bailout_early ? "SUPPRESSED " : "",
                 p_t_arr[rej_i], (int)bailout_early);
 
-        llama_token tok = sample_recovery(rej_idx, rejected_draft);
+        llama_token tok = sample_recovery(rej_idx, rejected_draft, rej_i);
 
         LOG_WRN("[PROB_ACCEPT] REJECT recovery=%d '%s' is_eog=%d\n",
                 tok, common_token_to_piece(vocab, tok, false).c_str(),
@@ -1059,7 +1116,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
     } else {
         // ---- Bonus token (all drafts accepted) ----
         const int bonus_idx = idxs[n_draft];
-        llama_token tok = sample_recovery(bonus_idx, LLAMA_TOKEN_NULL);
+        llama_token tok = sample_recovery(bonus_idx, LLAMA_TOKEN_NULL, SIZE_MAX);
 
         LOG_DBG("[PROB_ACCEPT] bonus=%d '%s' is_eog=%d\n",
                 tok, common_token_to_piece(vocab, tok, false).c_str(),

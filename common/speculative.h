@@ -53,6 +53,14 @@ struct common_speculative_draft_params {
     // Same size as *result.  Populated by the draft implementation for
     // use by common_sampler_sample_and_accept_n_prob.
     std::vector<float> * draft_probs = nullptr;
+
+    // per-draft candidate distributions (q_d) for exact recovery.
+    // Same size as *result.  Each entry contains the top-K candidates
+    // and their normalized probabilities from the draft model.
+    // When non-null, common_sampler_sample_and_accept_n_prob uses these
+    // for exact norm(max(0, p_t - q_d)) recovery instead of the
+    // single-token-zeroing approximation.
+    std::vector<std::vector<llama_token_data>> * draft_cands = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

@@ -1268,9 +1268,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                // Store draft probability for probabilistic verification.
+                // Store draft probability (top-K normalized, consistent
+                // with how the draft model sampled).  draft_cands below
+                // uses true full-vocab softmax for the recovery formula.
                 if (dp.draft_probs) {
                     dp.draft_probs->push_back(cur_p->data[0].p);
+                }
+
+                // Store full candidate distribution using true full-vocab
+                // softmax, for exact recovery norm(max(0, p_t - q_d)).
+                if (dp.draft_cands) {
+                    const float * raw_d = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    const int n_vocab_dft = llama_vocab_n_tokens(
+                        llama_model_get_vocab(llama_get_model(ctx_dft)));
+
+                    float mx = -INFINITY;
+                    for (int j = 0; j < n_vocab_dft; j++) {
+                        if (raw_d[j] > mx) mx = raw_d[j];
+                    }
+                    double Z_d = 0.0;
+                    for (int j = 0; j < n_vocab_dft; j++) {
+                        Z_d += expf(raw_d[j] - mx);
+                    }
+
+                    const int n_cand = std::min(10, (int)cur_p->size);
+                    std::vector<llama_token_data> cands;
+                    cands.reserve(n_cand);
+                    for (int k = 0; k < n_cand; k++) {
+                        llama_token_data entry = cur_p->data[k];
+                        entry.p = (Z_d > 0.0)
+                            ? expf(raw_d[entry.id] - mx) / (float)Z_d : 0.0f;
+                        cands.push_back(entry);
+                    }
+                    dp.draft_cands->push_back(std::move(cands));
                 }
 
                 if (params.n_max <= (int) result.size()) {

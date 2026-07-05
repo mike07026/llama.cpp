@@ -113,6 +113,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // mutated by this function.  The caller is responsible for accepting
 // the returned committed tokens into the real sampler chain.
 //
+// If draft_cands is non-null, the recovery distribution uses the full
+// draft candidate distribution for exact norm(max(0, p_t - q_d)) instead
+// of the single-token-zeroing approximation.
+//
 // Returns at least 1 token, up to idxs.size().
 std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         struct common_sampler * gsmpl,
@@ -120,6 +124,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         const std::vector<int> & idxs,
         const llama_tokens & draft,
         const std::vector<float> * draft_probs = nullptr,
+        const std::vector<std::vector<llama_token_data>> * draft_cands = nullptr,
         uint32_t seed = LLAMA_DEFAULT_SEED);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
