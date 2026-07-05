@@ -769,26 +769,22 @@ static llama_token spec_eos_to_think_end(const llama_vocab * vocab, struct llama
 //   of draft[i] via softmax over the complete vocabulary V.
 //
 //   Phase 2 — Compute joint acceptance thresholds.  For position i,
-//   the joint probability of accepting drafts 0..i is:
-//       p_tau[i] = prod_{j=0..i} p_t[j]
-//   (When q_d=1.0, each individual acceptance is r_j < p_t[j].)
+//   accept if r_i < p_t[i] / p_d[i] where p_d[i] is the draft model's
+//   probability of draft token i.  Falls back to p_d=1.0 (conservative)
+//   when draft_probs is unavailable.
 //
 //   Phase 3 — Rejection sampling.  For each position i, draw
-//   r_i ~ Uniform(0,1).  The first position where r_i > p_t[i] is the
-//   rejection point.  All tokens before that point are accepted.
+//   r_i ~ Uniform(0,1).  The first position where r_i > p_t[i] / p_d[i]
+//   is the rejection point.  All tokens before that point are accepted.
 //
 //   Phase 4 — Recovery.  The rejected draft token is zeroed from the
 //   raw full-vocab logits, and a replacement token is sampled from
-//   the resulting distribution via the sampler chain.
+//   the resulting distribution via the sampler chain.  (Approximation:
+//   zeros only the selected draft token rather than subtracting the
+//   full draft distribution q_d.)
 //
 //   Bonus token: sampled from the raw full-vocab logits via the full
 //   sampler chain (identical to MTP-OFF for q_d=1.0).
-//
-//   This implementation is mathematically exact for q_d=1.0:
-//   - p_t is a proper distribution over V (full-vocab softmax).
-//   - The residual norm(max(0, p_t - q_d)) = norm(p_t with draft zeroed)
-//     is exact (not an approximation) when q_d is one-hot.
-//   - The bonus token from p_t is exact for the same reason.
 std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
@@ -890,18 +886,22 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
     // Phase 2: Block verification — find first rejected position.
     //
     // For each position i, draw r_i ~ Uniform(0,1).
-    // Accept if r_i < p_t[i], otherwise stop.
+    // Accept if r_i < p_t[i] / p_d[i], where p_d[i] is the draft model's
+    // probability of draft token i (from draft_probs, if available).
+    // Falls back to p_d = 1.0 (conservative) when draft_probs is null.
     // ============================================================
     size_t accept_len = 0;
     for (size_t i = 0; i < n_draft; i++) {
-        const double r = uniform01(accept_rng);
-        if (r < (double)p_t_arr[i]) {
+        const double r   = uniform01(accept_rng);
+        const double p_d = draft_probs ? (double)(*draft_probs)[i] : 1.0;
+        const double threshold = (p_d > 0.0) ? (double)p_t_arr[i] / p_d : 0.0;
+        if (r < threshold) {
             accept_len = i + 1;
-            LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f -> ACCEPT, accept_len=%zu\n",
-                    i, r, p_t_arr[i], accept_len);
+            LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f p_d=%.6f t=%.6f -> ACCEPT, accept_len=%zu\n",
+                    i, r, p_t_arr[i], p_d, threshold, accept_len);
         } else {
-            LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f -> REJECT (first), accept_len=%zu\n",
-                    i, r, p_t_arr[i], accept_len);
+            LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f p_d=%.6f t=%.6f -> REJECT (first), accept_len=%zu\n",
+                    i, r, p_t_arr[i], p_d, threshold, accept_len);
             break;
         }
     }
