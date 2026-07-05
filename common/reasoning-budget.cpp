@@ -248,6 +248,17 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
     return ((const common_reasoning_budget_ctx *)smpl->ctx)->state;
 }
 
+llama_token common_reasoning_budget_get_end_token(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const auto * ctx = (const common_reasoning_budget_ctx *)smpl->ctx;
+    if (ctx->end_matcher.tokens.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return ctx->end_matcher.tokens[0];
+}
+
 bool common_reasoning_budget_force(struct llama_sampler * smpl) {
     if (!smpl) {
         return false;

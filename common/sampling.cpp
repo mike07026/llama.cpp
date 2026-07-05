@@ -539,6 +539,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// Forward declaration — defined below after spec_find_think_end.
+static llama_token spec_eos_to_think_end(const llama_vocab * vocab, struct llama_sampler * rbudget, llama_token token);
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -551,6 +554,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     gsmpl->set_logits(ctx, idx);
 
@@ -588,7 +593,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
-        return id;
+        return spec_eos_to_think_end(vocab, rbudget, id);
     }
 
     // check if it the sampled token fits the grammar (grammar-based rejection sampling)
@@ -600,7 +605,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
         if (is_valid) {
-            return id;
+            return spec_eos_to_think_end(vocab, rbudget, id);
         }
     }
 
@@ -620,7 +625,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     id = cur_p.data[cur_p.selected].id;
 
-    return id;
+    return spec_eos_to_think_end(vocab, rbudget, id);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -690,6 +695,68 @@ static llama_token spec_find_think_end(const llama_vocab * vocab) {
     return 248069;
 }
 
+// Shared helper: if the given token is EOS and reasoning budget is still active
+// (COUNTING or FORCING), replace EOS with the </think> token to force the model
+// out of the thinking block and into response mode.  Returns the original token
+// if no replacement is needed.
+//
+// Prefers the end token from the reasoning budget sampler (model-agnostic).
+// Falls back to searching the vocabulary for "</think>" if rbudget has no end
+// tokens configured.
+static llama_token spec_eos_to_think_end(const llama_vocab * vocab, struct llama_sampler * rbudget, llama_token token) {
+    if (token == LLAMA_TOKEN_NULL || !rbudget || !vocab) {
+        return token;
+    }
+    if (!llama_vocab_is_eog(vocab, token)) {
+        return token;
+    }
+    const auto state = common_reasoning_budget_get_state(rbudget);
+    if (state != REASONING_BUDGET_COUNTING && state != REASONING_BUDGET_FORCING) {
+        return token;
+    }
+
+    // EOS detected while the reasoning budget is still active —
+    // the model tried to end generation before closing the think block.
+    LOG_WRN("[EOS_WORKAROUND] EOS during thinking: rbudget_state=%d eos_tok=%d '%s'\n",
+            (int)state, token,
+            common_token_to_piece(vocab, token, false).c_str());
+
+    // Prefer the rbudget-configured end token (model-agnostic).
+    llama_token think_end = common_reasoning_budget_get_end_token(rbudget);
+
+    if (think_end != LLAMA_TOKEN_NULL) {
+        static bool s_logged_rbudget_source = false;
+        if (!s_logged_rbudget_source) {
+            s_logged_rbudget_source = true;
+            LOG_INF("[EOS_WORKAROUND] source=rbudget end_token=%d '%s'\n",
+                    think_end,
+                    common_token_to_piece(vocab, think_end, false).c_str());
+        }
+    } else {
+        // Fallback: hardcoded </think> search for models that didn't
+        // configure end tokens in the reasoning budget.
+        static llama_token s_think_end_hardcoded = LLAMA_TOKEN_NULL;
+        if (s_think_end_hardcoded == LLAMA_TOKEN_NULL) {
+            s_think_end_hardcoded = spec_find_think_end(vocab);
+            LOG_INF("[EOS_WORKAROUND] source=fallback (rbudget has no end token) token=%d '%s'\n",
+                    s_think_end_hardcoded,
+                    common_token_to_piece(vocab, s_think_end_hardcoded, false).c_str());
+        }
+        think_end = s_think_end_hardcoded;
+    }
+
+    if (think_end != LLAMA_TOKEN_NULL) {
+        LOG_WRN("[EOS_WORKAROUND] REPLACE EOS→think_end tok=%d→%d\n", token, think_end);
+        return think_end;
+    }
+
+    // Both rbudget and fallback failed to produce a think_end token.
+    LOG_WRN("[EOS_WORKAROUND] no think_end token available (rbudget & fallback both failed), "
+            "letting EOS through tok=%d '%s'\n",
+            token, common_token_to_piece(vocab, token, false).c_str());
+    return token;
+}
+
 // Probabilistic speculative verification (Block Verification variant).
 //
 //   Sun et al. (2024): "Block Verification Accelerates Speculative Decoding"
@@ -737,13 +804,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
     result.reserve(idxs.size());
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
-
-    static llama_token s_think_end = LLAMA_TOKEN_NULL;
-    if (s_think_end == LLAMA_TOKEN_NULL) {
-        s_think_end = spec_find_think_end(vocab);
-        LOG_INF("[PROB_ACCEPT] s_think_end=%d '%s'\n",
-                s_think_end, common_token_to_piece(vocab, s_think_end, false).c_str());
-    }
 
     common_sampler_ptr smpl_tmp(common_sampler_clone(gsmpl));
 
@@ -971,15 +1031,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 i, tok,
                 common_token_to_piece(vocab, tok, false).c_str(),
                 p_t_arr[i]);
-        // EOS workaround.
-        if (llama_vocab_is_eog(vocab, tok) &&
-            smpl_tmp->rbudget &&
-            (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
-             common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
-            LOG_WRN("[PROB_ACCEPT] ACCEPT EOS→think_end rbudget_state=%d\n",
-                    (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
-            tok = s_think_end;
-        }
+        tok = spec_eos_to_think_end(vocab, smpl_tmp->rbudget, tok);
         result.push_back(tok);
         do_accept(tok);
     }
@@ -1001,15 +1053,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 tok, common_token_to_piece(vocab, tok, false).c_str(),
                 llama_vocab_is_eog(vocab, tok));
 
-        // EOS workaround.
-        if (llama_vocab_is_eog(vocab, tok) &&
-            smpl_tmp->rbudget &&
-            (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
-             common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
-            LOG_WRN("[PROB_ACCEPT] REJECT EOS→think_end rbudget_state=%d\n",
-                    (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
-            tok = s_think_end;
-        }
+        tok = spec_eos_to_think_end(vocab, smpl_tmp->rbudget, tok);
         result.push_back(tok);
         do_accept(tok);
     } else {
@@ -1021,15 +1065,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 tok, common_token_to_piece(vocab, tok, false).c_str(),
                 llama_vocab_is_eog(vocab, tok));
 
-        // EOS workaround.
-        if (llama_vocab_is_eog(vocab, tok) &&
-            smpl_tmp->rbudget &&
-            (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
-             common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
-            LOG_WRN("[PROB_ACCEPT] bonus EOS→think_end rbudget_state=%d\n",
-                    (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
-            tok = s_think_end;
-        }
+        tok = spec_eos_to_think_end(vocab, smpl_tmp->rbudget, tok);
         result.push_back(tok);
     }
 
