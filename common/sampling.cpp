@@ -665,16 +665,28 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // Find the </think> token ID in the full vocabulary.
 // Qwen-family models have composite token 248069, but </think> may be
-// split across multiple tokens.  Search the full vocab by text.
+// Find the </think> token in the full vocabulary by exact text match.
+// For Qwen-family models this is typically a composite token (e.g. 248069).
+// For other reasoning models (DeepSeek, Gemma4, Mistral) the end tag may
+// be different or multi-token — the caller should prefer
+// common_reasoning_budget_get_end_token() when rbudget is available.
 static llama_token spec_find_think_end(const llama_vocab * vocab) {
     int n_vocab = llama_vocab_n_tokens(vocab);
     for (int j = 0; j < n_vocab; j++) {
         std::string text = common_token_to_piece(vocab, (llama_token)j, false);
         if (text == "</think>") {
+            LOG_WRN("[PROB_ACCEPT] spec_find_think_end: found </think> at token=%d "
+                    "(vocab_size=%d)\n", j, n_vocab);
             return (llama_token)j;
         }
     }
-    // Fallback: known Qwen ID.
+    // Fallback: known Qwen ID.  This may be wrong for non-Qwen models,
+    // but is only used when rbudget is active AND the exact "</think>"
+    // text search failed — in which case the model has a multi-token
+    // end sequence and the workaround token may still close the block.
+    LOG_WRN("[PROB_ACCEPT] spec_find_think_end: </think> NOT FOUND in vocab "
+            "(vocab_size=%d), using Qwen fallback=%d\n",
+            n_vocab, 248069);
     return 248069;
 }
 
