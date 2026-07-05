@@ -85,29 +85,22 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
-// Probabilistic speculative verification with Block Verification.
+// Probabilistic speculative verification (Leviathan et al. 2022).
 //
-// Sun et al. (2024): "Block Verification Accelerates Speculative Decoding"
-// https://arxiv.org/abs/2403.10444
-//
-// With q_d = 1.0 (one-hot draft, conservative variant):
-//
-//   Phase 1: Precompute p_t[i] = softmax_full_vocab(raw_logits)[draft[i]]
-//   Phase 2: For each i, accept draft[i] iff r_i < p_t[i] where r_i ~ Uniform(0,1)
-//   Phase 3: On first rejection, sample recovery from raw logits with
-//            the rejected draft zeroed, via the sampler chain
-//   Phase 4 (bonus): If all accepted, sample bonus from raw logits via
-//            the full sampler chain
+// Conservative variant: accept draft[i] if r < p_t(x_i) where
+// r ~ Uniform(0,1) and p_t is the target model's true
+// probability at x_i, computed via softmax over the full vocabulary from raw
+// logits.  Equivalent to the full Leviathan criterion min(1, p_t/q_d) with q_d = 1.0.
 //
 // The draft_probs parameter is accepted for API compatibility but
-// currently unused -- q_d is forced to 1.0 because the draft model's
-// top_k=10 probability and the target model's full-vocab probability
-// live in different spaces (different denominators), making the ratio
-// p_t/q_d invalid.
+// currently unused — q_d is forced to 1.0 because the draft model's
+// top_k=10 probability and the target model's full-vocab
+// probability live in different spaces (different denominators),
+// making the ratio p_t/q_d invalid.
 //
-// All recovery/resample tokens are sampled from the raw full-vocab
-// logits (not chain-filtered candidates), ensuring mathematical
-// consistency with the p_t computation.
+// On rejection, the recovered token is sampled from the target
+// distribution p_t (a target-only resample).  If all drafts are accepted,
+// a bonus token is sampled from p_t at idxs[draft.size()].
 //
 // The sampler state (penalties, grammar, reasoning budget) is NOT
 // mutated by this function.  The caller is responsible for accepting

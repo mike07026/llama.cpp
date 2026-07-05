@@ -4213,15 +4213,30 @@ private:
                 // token).  The probabilistic verify function uses its own
                 // RNG, so the main sampler's RNG is still at the pre-verify
                 // position after accept().
+                //
+                // We advance only the dist sampler directly, not the full
+                // chain — running dummy data through filters like top_k,
+                // top_p, temperature, or xtc is unnecessary and risks
+                // subtle state pollution.
                 {
                     auto * chain = common_sampler_get(slot.smpl.get());
-                    llama_token_data dummy[2] = {{0, 0.0f, 0.0f}, {1, 0.0f, 0.0f}};
-                    llama_token_data_array dummy_arr = {dummy, 2, 0, false};
-                    for (size_t j = 0; j < accepted.size(); j++) {
-                        dummy_arr.data[0].logit = 1.0f;
-                        dummy_arr.data[1].logit = 0.0f;
-                        dummy_arr.selected = -1;
-                        llama_sampler_apply(chain, &dummy_arr);
+                    struct llama_sampler * dist_smpl = nullptr;
+                    for (int k = 0; k < llama_sampler_chain_n(chain); k++) {
+                        auto * ch = llama_sampler_chain_get(chain, k);
+                        if (llama_sampler_dist_get_rng(ch) != nullptr) {
+                            dist_smpl = ch;
+                            break;
+                        }
+                    }
+                    if (dist_smpl) {
+                        llama_token_data dummy[2] = {{0, 0.0f, 0.0f}, {1, 0.0f, 0.0f}};
+                        llama_token_data_array dummy_arr = {dummy, 2, 0, false};
+                        for (size_t j = 0; j < accepted.size(); j++) {
+                            dummy_arr.data[0].logit = 1.0f;
+                            dummy_arr.data[1].logit = 0.0f;
+                            dummy_arr.selected = -1;
+                            llama_sampler_apply(dist_smpl, &dummy_arr);
+                        }
                     }
                 }
 

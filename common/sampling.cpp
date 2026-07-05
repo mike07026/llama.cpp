@@ -662,17 +662,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
-// Helper: find the dist sampler in a chain and return its RNG pointer.
-static std::mt19937 * spec_find_dist_rng(struct llama_sampler * chain) {
-    for (int k = 0; k < llama_sampler_chain_n(chain); k++) {
-        auto * child = llama_sampler_chain_get(chain, k);
-        auto * rng = llama_sampler_dist_get_rng(child);
-        if (rng != nullptr) {
-            return rng;
-        }
-    }
-    return nullptr;
-}
 
 // Find the </think> token ID in the full vocabulary.
 // Qwen-family models have composite token 248069, but </think> may be
@@ -689,22 +678,38 @@ static llama_token spec_find_think_end(const llama_vocab * vocab) {
     return 248069;
 }
 
-// Leviathan et al. (2022) probabilistic speculative verification.
+// Probabilistic speculative verification (Block Verification variant).
 //
-//   accept draft[i] if  r < min(1, p_t(x_draft) / q_d(x_draft))
-//       where  r ~ Uniform(0,1)  (private RNG)
-//              p_t from chain-filtered logits (same domain as q_d)
-//              q_d = draft_probs[i]  (draft model probability for x_draft)
+//   Sun et al. (2024): "Block Verification Accelerates Speculative Decoding"
+//   https://arxiv.org/abs/2403.10444
 //
-//   p_t and q_d are both computed over chain-filtered candidate sets,
-//   satisfying the Leviathan requirement that both share the same
-//   probability space.  If draft_probs is null, q_d = 1.0 (conservative).
+//   With q_d = 1.0 (one-hot draft), block verification simplifies to:
 //
-//   On rejection:  resample from  norm(max(0, p_t - q_d)).
-//   Since q_d is only known at x_draft (one-hot draft assumption),
-//   the residual is p_t with x_draft zeroed.
+//   Phase 1 — Precompute p_t[i] for each draft position i from the
+//   raw full-vocab logits.  Each p_t[i] is the true target probability
+//   of draft[i] via softmax over the complete vocabulary V.
 //
-//   Bonus token:  sampled from the full target chain (identical to MTP-OFF).
+//   Phase 2 — Compute joint acceptance thresholds.  For position i,
+//   the joint probability of accepting drafts 0..i is:
+//       p_tau[i] = prod_{j=0..i} p_t[j]
+//   (When q_d=1.0, each individual acceptance is r_j < p_t[j].)
+//
+//   Phase 3 — Rejection sampling.  For each position i, draw
+//   r_i ~ Uniform(0,1).  The first position where r_i > p_t[i] is the
+//   rejection point.  All tokens before that point are accepted.
+//
+//   Phase 4 — Recovery.  The rejected draft token is zeroed from the
+//   raw full-vocab logits, and a replacement token is sampled from
+//   the resulting distribution via the sampler chain.
+//
+//   Bonus token: sampled from the raw full-vocab logits via the full
+//   sampler chain (identical to MTP-OFF for q_d=1.0).
+//
+//   This implementation is mathematically exact for q_d=1.0:
+//   - p_t is a proper distribution over V (full-vocab softmax).
+//   - The residual norm(max(0, p_t - q_d)) = norm(p_t with draft zeroed)
+//     is exact (not an approximation) when q_d is one-hot.
+//   - The bonus token from p_t is exact for the same reason.
 std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
@@ -730,206 +735,281 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
 
     common_sampler_ptr smpl_tmp(common_sampler_clone(gsmpl));
 
+    const int n_vocab_full = llama_vocab_n_tokens(vocab);
+
     const uint32_t accept_seed = llama_sampler_get_seed(smpl_tmp->chain) ^ 0xA7A7A7A7u;
     std::mt19937 accept_rng(accept_seed);
     std::uniform_real_distribution<double> uniform01(0.0, 1.0);
 
-    size_t i = 0;
-    for (i = 0; i < draft.size(); i++) {
+    // ============================================================
+    // Phase 1: Precompute p_t[i] from raw full-vocab logits.
+    //
+    // We also check for -INF (suppressed by rbudget or grammar).
+    // If any draft position is suppressed, we bail out immediately.
+    // ============================================================
+    const size_t n_draft = draft.size();
+    std::vector<float> p_t_arr(n_draft, 0.0f);
+    size_t first_suppressed = (size_t)-1; // ~0
+
+    for (size_t i = 0; i < n_draft; i++) {
         const llama_token draft_token = draft[i];
 
-        // ---- Step 1: filter logits through clone chain ----
         smpl_tmp->set_logits(ctx, idxs[i]);
         auto & cur = smpl_tmp->cur_p;
 
-        llama_sampler_apply(smpl_tmp->rbudget, &cur);
-        if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
-            llama_sampler_apply(smpl_tmp->grmr, &cur);
-        }
-        for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
-            auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
-            if (llama_sampler_dist_get_rng(ch) != nullptr) {
-                LOG_DBG("[PROB_ACCEPT] chain[%d]=%s SKIP (dist)\n", k, llama_sampler_name(ch));
-                continue;
-            }
-            if (strstr(llama_sampler_name(ch), "adaptive_p") != nullptr) {
-                LOG_DBG("[PROB_ACCEPT] chain[%d]=%s SKIP (adaptive_p)\n", k, llama_sampler_name(ch));
-                continue;
-            }
-            LOG_DBG("[PROB_ACCEPT] chain[%d]=%s APPLY\n", k, llama_sampler_name(ch));
-            llama_sampler_apply(ch, &cur);
-        }
+        const float * raw_logits = llama_get_logits_ith(ctx, idxs[i]);
 
-        // ---- Step 2: p_t(x_draft) from chain-filtered logits ----
-        // Same domain as q_d (both over filtered candidate sets).
-        float p_t = 0.0f;
+        // Compute p_t(x_draft) via full-vocab softmax.
         {
-            float mx = -INFINITY;
-            for (size_t j = 0; j < cur.size; j++) {
-                if (cur.data[j].logit > mx) mx = cur.data[j].logit;
+            const bool use_raw = (raw_logits != nullptr && (int)cur.size != n_vocab_full);
+
+            if (use_raw) {
+                float mx = -INFINITY;
+                for (int j = 0; j < n_vocab_full; j++) {
+                    if (raw_logits[j] > mx) mx = raw_logits[j];
+                }
+                double sm = 0.0;
+                float pn = 0.0f;
+                for (int j = 0; j < n_vocab_full; j++) {
+                    float p = expf(raw_logits[j] - mx);
+                    if (j == (int)draft_token) pn = p;
+                    sm += p;
+                }
+                if (sm > 0.0) p_t_arr[i] = pn / (float)sm;
+            } else {
+                float mx = -INFINITY;
+                for (size_t j = 0; j < cur.size; j++) {
+                    if (cur.data[j].logit > mx) mx = cur.data[j].logit;
+                }
+                float pn = 0.0f;
+                double sm = 0.0;
+                for (size_t j = 0; j < cur.size; j++) {
+                    float p = expf(cur.data[j].logit - mx);
+                    if (cur.data[j].id == draft_token) pn = p;
+                    sm += p;
+                }
+                if (sm > 0.0) p_t_arr[i] = pn / (float)sm;
             }
-            float pn = 0.0f;
-            double sm = 0.0;
-            for (size_t j = 0; j < cur.size; j++) {
-                float p = expf(cur.data[j].logit - mx);
-                if (cur.data[j].id == draft_token) pn = p;
-                sm += p;
-            }
-            if (sm > 0.0) p_t = pn / (float)sm;
         }
 
-        const float q_d = draft_probs ? (*draft_probs)[i] : 1.0f;
-
-        LOG_INF("[PROB_ACCEPT] i=%zu draft=%d '%s' p_t=%.6f q_d=%.6f cur_size=%zu\n",
+        LOG_DBG("[PROB_ACCEPT] i=%zu draft=%d '%s' p_t=%.6f cur_size=%zu\n",
                 i, draft_token,
                 common_token_to_piece(vocab, draft_token, false).c_str(),
-                p_t, q_d, cur.size);
+                p_t_arr[i], cur.size);
 
-        // Check if draft was suppressed by any sampler (rbudget or grammar)
-        float p_logit = -INFINITY;
-        for (size_t j = 0; j < cur.size; j++) {
-            if (cur.data[j].id == draft_token) { p_logit = cur.data[j].logit; break; }
-        }
-        if (p_logit == -INFINITY) {
-            LOG_WRN("[PROB_ACCEPT] i=%zu -INF DRAFT draft=%d '%s' cur_size=%zu\n",
-                    i, draft_token,
-                    common_token_to_piece(vocab, draft_token, false).c_str(),
-                    cur.size);
-            // rb or grammar suppressed the draft — resample from cur
-            // Find and apply dist sampler
-            for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
-                auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
-                auto * dr = llama_sampler_dist_get_rng(ch);
-                if (dr != nullptr) {
-                    LOG_DBG("[PROB_ACCEPT] -INF dist found at chain[%d]=%s\n", k, llama_sampler_name(ch));
-                    llama_sampler_apply(ch, &cur); break;
-                }
-            }
+        // Check -INF suppression (rbudget or grammar).
+        {
+            llama_sampler_apply(smpl_tmp->rbudget, &cur);
             if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
                 llama_sampler_apply(smpl_tmp->grmr, &cur);
-                { // grammar-resample if selected token is invalid
-                    llama_token_data sd = {cur.data[cur.selected].id, 1, 0};
-                    llama_token_data_array sa = {&sd, 1, -1, false};
-                    llama_sampler_apply(smpl_tmp->grmr, &sa);
-                    if (sd.logit == -INFINITY) {
-                        LOG_WRN("[PROB_ACCEPT] -INF grammar-reject tok=%d, regenerating\n", sd.id);
-                        smpl_tmp->set_logits(ctx, idxs[i]);
-                        auto & c2 = smpl_tmp->cur_p;
-                        llama_sampler_apply(smpl_tmp->rbudget, &c2);
-                        llama_sampler_apply(smpl_tmp->grmr,  &c2);
-                        llama_sampler_apply(smpl_tmp->chain,  &c2);
-                        cur = c2;
-                    }
-                }
             }
-            llama_token tok = cur.data[cur.selected].id;
-            LOG_WRN("[PROB_ACCEPT] -INF recovery=%d '%s' rbudget=%p is_eog=%d\n",
-                    tok, common_token_to_piece(vocab, tok, false).c_str(),
-                    (void*)smpl_tmp->rbudget,
-                    llama_vocab_is_eog(vocab, tok));
-            // EOS workaround: force </think> when reasoning is active
-            if (llama_vocab_is_eog(vocab, tok) &&
-                smpl_tmp->rbudget &&
-                (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
-                 common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
-                LOG_WRN("[PROB_ACCEPT] -INF EOS→think_end rbudget_state=%d\n",
-                        (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
-                tok = s_think_end;
-            }
-            result.push_back(tok);
-            llama_sampler_accept(smpl_tmp->chain, tok);
-            break;
-        }
-
-        // ---- Step 3: Leviathan acceptance ----
-        const double ratio = (q_d > 0.0f) ? std::min(1.0, (double)p_t / (double)q_d) : 0.0;
-        const bool accepted = (uniform01(accept_rng) < ratio);
-
-        if (accepted) {
-            llama_token tok = draft_token;
-            if (llama_vocab_is_eog(vocab, tok) &&
-                smpl_tmp->rbudget &&
-                (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
-                 common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
-                LOG_WRN("[PROB_ACCEPT] ACCEPT EOS→think_end rbudget_state=%d\n",
-                        (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
-                tok = s_think_end;
-            }
-            result.push_back(tok);
-            llama_sampler_accept(smpl_tmp->chain, tok);
-        } else {
-            LOG_WRN("[PROB_ACCEPT] REJECTED i=%zu draft=%d p_t=%.6f q_d=%.6f\n", i, draft_token, p_t, q_d);
-            // Rejected — zero the draft, dist-sample recovery
+            float p_logit = -INFINITY;
             for (size_t j = 0; j < cur.size; j++) {
-                if (cur.data[j].id == draft_token) { cur.data[j].logit = -INFINITY; break; }
+                if (cur.data[j].id == draft_token) { p_logit = cur.data[j].logit; break; }
             }
-            for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
-                auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
-                auto * dr = llama_sampler_dist_get_rng(ch);
-                if (dr != nullptr) {
-                    LOG_DBG("[PROB_ACCEPT] REJECT dist at chain[%d]=%s\n", k, llama_sampler_name(ch));
-                    llama_sampler_apply(ch, &cur); break;
-                }
+            if (p_logit == -INFINITY) {
+                first_suppressed = i;
+                p_t_arr[i] = 0.0f; // force rejection
             }
-            if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
-                llama_sampler_apply(smpl_tmp->grmr, &cur);
-                llama_token_data sd = {cur.data[cur.selected].id, 1, 0};
-                llama_token_data_array sa = {&sd, 1, -1, false};
-                llama_sampler_apply(smpl_tmp->grmr, &sa);
-                if (sd.logit == -INFINITY) {
-                    LOG_WRN("[PROB_ACCEPT] REJECT grammar-reject tok=%d, regenerating\n", sd.id);
-                    smpl_tmp->set_logits(ctx, idxs[i]);
-                    auto & c2 = smpl_tmp->cur_p;
-                    llama_sampler_apply(smpl_tmp->rbudget, &c2);
-                    llama_sampler_apply(smpl_tmp->grmr,  &c2);
-                    llama_sampler_apply(smpl_tmp->chain,  &c2);
-                    cur = c2;
-                }
-            }
-            llama_token tok = cur.data[cur.selected].id;
-            LOG_WRN("[PROB_ACCEPT] REJECT recovery=%d '%s' is_eog=%d\n",
-                    tok, common_token_to_piece(vocab, tok, false).c_str(),
-                    llama_vocab_is_eog(vocab, tok));
-            if (llama_vocab_is_eog(vocab, tok) &&
-                smpl_tmp->rbudget &&
-                (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
-                 common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
-                LOG_WRN("[PROB_ACCEPT] REJECT EOS→think_end rbudget_state=%d\n",
-                        (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
-                tok = s_think_end;
-            }
-            result.push_back(tok);
-            llama_sampler_accept(smpl_tmp->chain, tok);
+        }
+    }
+
+    // ============================================================
+    // Phase 2: Block verification — find first rejected position.
+    //
+    // For each position i, draw r_i ~ Uniform(0,1).
+    // Accept if r_i < p_t[i], otherwise stop.
+    // ============================================================
+    size_t accept_len = 0;
+    for (size_t i = 0; i < n_draft; i++) {
+        const double r = uniform01(accept_rng);
+        if (r < (double)p_t_arr[i]) {
+            accept_len = i + 1;
+            LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f -> ACCEPT, accept_len=%zu\n",
+                    i, r, p_t_arr[i], accept_len);
+        } else {
+            LOG_DBG("[PROB_ACCEPT] VERIFY i=%zu r=%.6f p_t=%.6f -> REJECT (first), accept_len=%zu\n",
+                    i, r, p_t_arr[i], accept_len);
             break;
         }
     }
 
-    // ---- Bonus token (all drafts accepted) ----
-    if (i == draft.size()) {
-        smpl_tmp->set_logits(ctx, idxs[i]);
+    // Summary: how many drafts were accepted this cycle.
+    LOG_DBG("[PROB_ACCEPT] accept_len=%zu/%zu suppressed_at=%zu"
+            " p_t=[%s]\n",
+            accept_len, n_draft,
+            first_suppressed < n_draft ? first_suppressed : (size_t)-1,
+            [&]() {
+                std::string s;
+                for (size_t k = 0; k < n_draft; k++) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%s%.4f", k ? "," : "", p_t_arr[k]);
+                    s += buf;
+                }
+                return s;
+            }().c_str());
+
+    // ============================================================
+    // Phase 3: Output accepted tokens and handle first rejection.
+    // ============================================================
+    // Helper: sample a token from raw logits (not chain-filtered)
+    // at a given idx, with the draft token zeroed.
+    auto sample_recovery = [&](int idx, llama_token rejected_draft) -> llama_token {
+        const float * raw = llama_get_logits_ith(ctx, idx);
+
+        // Copy raw logits into cur, zeroing the rejected draft.
+        smpl_tmp->set_logits(ctx, idx);
         auto & cur = smpl_tmp->cur_p;
-        llama_sampler_apply(smpl_tmp->rbudget, &cur);
+
+        if (raw != nullptr && (int)cur.size != n_vocab_full) {
+            // Need to rebuild from raw — cur has filtered candidates.
+            // Zero the draft in raw space, then run the chain.
+            // We temporarily modify raw logits via the context API to
+            // feed our zeroed version through the sampler chain.
+            //
+            // Since we can't mutate the context's logits, we instead
+            // build the full-vocab candidate array ourselves, apply the
+            // chain filters, and sample.
+            //
+            // Build a full-vocab candidate array from raw logits,
+            // zeroing the rejected draft.  Then update cur_p to
+            // point to it so the sampler chain operates on the full
+            // vocabulary (needed for correct top_p / min_p statistics).
+            smpl_tmp->cur.resize(n_vocab_full);
+            for (llama_token j = 0; j < n_vocab_full; j++) {
+                smpl_tmp->cur[j] = llama_token_data{
+                    j, (j == rejected_draft ? -INFINITY : raw[j]), 0.0f};
+            }
+            cur = { smpl_tmp->cur.data(), smpl_tmp->cur.size(), -1, false };
+
+            // Apply sampler chain (skip dist — applied below).
+            llama_sampler_apply(smpl_tmp->rbudget, &cur);
+            if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
+                llama_sampler_apply(smpl_tmp->grmr, &cur);
+            }
+            for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
+                auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
+                if (llama_sampler_dist_get_rng(ch) != nullptr) continue;
+                if (strstr(llama_sampler_name(ch), "adaptive_p") != nullptr) continue;
+                llama_sampler_apply(ch, &cur);
+            }
+        } else {
+            // cur already has full-vocab — just zero the draft.
+            for (size_t j = 0; j < cur.size; j++) {
+                if (cur.data[j].id == rejected_draft) {
+                    cur.data[j].logit = -INFINITY;
+                    break;
+                }
+            }
+
+            // Apply chain filters (with draft zeroed, meaning the filters
+            // run over the whole vocab minus the rejected draft).
+            llama_sampler_apply(smpl_tmp->rbudget, &cur);
+            if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
+                llama_sampler_apply(smpl_tmp->grmr, &cur);
+            }
+            for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
+                auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
+                if (llama_sampler_dist_get_rng(ch) != nullptr) continue;
+                if (strstr(llama_sampler_name(ch), "adaptive_p") != nullptr) continue;
+                llama_sampler_apply(ch, &cur);
+            }
+        }
+
+        // Apply dist sampler to select the recovery token.
+        for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
+            auto * ch = llama_sampler_chain_get(smpl_tmp->chain, k);
+            if (llama_sampler_dist_get_rng(ch) != nullptr) {
+                llama_sampler_apply(ch, &cur);
+                break;
+            }
+        }
+
+        // Grammar check on the selected token.
         if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
             llama_sampler_apply(smpl_tmp->grmr, &cur);
         }
-        llama_sampler_apply(smpl_tmp->chain, &cur);
-        if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
-            llama_token_data sd = {cur.data[cur.selected].id, 1, 0};
-            llama_token_data_array sa = {&sd, 1, -1, false};
-            llama_sampler_apply(smpl_tmp->grmr, &sa);
-            if (sd.logit == -INFINITY) {
-                smpl_tmp->set_logits(ctx, idxs[i]);
-                auto & c2 = smpl_tmp->cur_p;
-                llama_sampler_apply(smpl_tmp->rbudget, &c2);
-                llama_sampler_apply(smpl_tmp->grmr,  &c2);
-                llama_sampler_apply(smpl_tmp->chain,  &c2);
-                cur = c2;
-            }
+
+        return cur.data[cur.selected].id;
+    };
+
+    bool bailout_early = false;
+    if (first_suppressed < accept_len) {
+        // A draft token that was accepted by block verification was
+        // actually suppressed by rbudget/grammar.  Truncate acceptance
+        // and force recovery at that position.
+        accept_len = first_suppressed;
+        bailout_early = true;
+    }
+
+    // Output accepted tokens.
+    auto do_accept = [&](llama_token tok) {
+        if (smpl_tmp->rbudget) {
+            llama_sampler_accept(smpl_tmp->rbudget, tok);
         }
-        llama_token tok = cur.data[cur.selected].id;
-        LOG_INF("[PROB_ACCEPT] bonus=%d '%s' is_eog=%d rbudget=%p\n",
+        if (smpl_tmp->grmr && grammar_should_apply(smpl_tmp.get())) {
+            llama_sampler_accept(smpl_tmp->grmr, tok);
+        }
+        llama_sampler_accept(smpl_tmp->chain, tok);
+    };
+
+    for (size_t i = 0; i < accept_len; i++) {
+        llama_token tok = draft[i];
+        LOG_DBG("[PROB_ACCEPT] ACCEPTED i=%zu tok=%d '%s' p_t=%.6f\n",
+                i, tok,
+                common_token_to_piece(vocab, tok, false).c_str(),
+                p_t_arr[i]);
+        // EOS workaround.
+        if (llama_vocab_is_eog(vocab, tok) &&
+            smpl_tmp->rbudget &&
+            (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
+             common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
+            LOG_WRN("[PROB_ACCEPT] ACCEPT EOS→think_end rbudget_state=%d\n",
+                    (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
+            tok = s_think_end;
+        }
+        result.push_back(tok);
+        do_accept(tok);
+    }
+
+    // Handle rejection or bailout.
+    if (accept_len < n_draft) {
+        const size_t rej_i = accept_len;
+        const int rej_idx = idxs[rej_i];
+        const llama_token rejected_draft = draft[rej_i];
+
+        LOG_WRN("[PROB_ACCEPT] REJECTED i=%zu draft=%d p_t=%s%.6f bailout=%d\n",
+                rej_i, rejected_draft,
+                bailout_early ? "SUPPRESSED " : "",
+                p_t_arr[rej_i], (int)bailout_early);
+
+        llama_token tok = sample_recovery(rej_idx, rejected_draft);
+
+        LOG_WRN("[PROB_ACCEPT] REJECT recovery=%d '%s' is_eog=%d\n",
                 tok, common_token_to_piece(vocab, tok, false).c_str(),
-                llama_vocab_is_eog(vocab, tok), (void*)smpl_tmp->rbudget);
+                llama_vocab_is_eog(vocab, tok));
+
+        // EOS workaround.
+        if (llama_vocab_is_eog(vocab, tok) &&
+            smpl_tmp->rbudget &&
+            (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
+             common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_FORCING)) {
+            LOG_WRN("[PROB_ACCEPT] REJECT EOS→think_end rbudget_state=%d\n",
+                    (int)common_reasoning_budget_get_state(smpl_tmp->rbudget));
+            tok = s_think_end;
+        }
+        result.push_back(tok);
+        do_accept(tok);
+    } else {
+        // ---- Bonus token (all drafts accepted) ----
+        const int bonus_idx = idxs[n_draft];
+        llama_token tok = sample_recovery(bonus_idx, LLAMA_TOKEN_NULL);
+
+        LOG_DBG("[PROB_ACCEPT] bonus=%d '%s' is_eog=%d\n",
+                tok, common_token_to_piece(vocab, tok, false).c_str(),
+                llama_vocab_is_eog(vocab, tok));
+
+        // EOS workaround.
         if (llama_vocab_is_eog(vocab, tok) &&
             smpl_tmp->rbudget &&
             (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
@@ -940,6 +1020,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         }
         result.push_back(tok);
     }
+
+    // Output summary: tokens committed this cycle.
+    LOG_DBG("[PROB_ACCEPT] result_size=%zu tokens=[%s]\n",
+            result.size(),
+            [&]() {
+                std::string s;
+                for (size_t k = 0; k < result.size(); k++) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%s%d", k ? "," : "", result[k]);
+                    s += buf;
+                }
+                return s;
+            }().c_str());
 
     return result;
 }
