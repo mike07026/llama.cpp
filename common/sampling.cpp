@@ -674,35 +674,26 @@ static std::mt19937 * spec_find_dist_rng(struct llama_sampler * chain) {
     return nullptr;
 }
 
-// Find the </think> token ID in the full vocabulary.
-// Qwen-family models have composite token 248069, but </think> may be
-// split across multiple tokens.  Search the full vocab by text.
-static llama_token spec_find_think_end(const llama_vocab * vocab) {
-    int n_vocab = llama_vocab_n_tokens(vocab);
-    for (int j = 0; j < n_vocab; j++) {
-        std::string text = common_token_to_piece(vocab, (llama_token)j, false);
-        if (text == "</think>") {
-            return (llama_token)j;
-        }
-    }
-    // Fallback: known Qwen ID.
-    return 248069;
-}
 
 // Leviathan et al. (2022) probabilistic speculative verification.
 //
 //   accept draft[i] if  r < min(1, p_t(x_draft) / q_d(x_draft))
 //       where  r ~ Uniform(0,1)  (private RNG)
-//              p_t from chain-filtered logits (same domain as q_d)
-//              q_d = draft_probs[i]  (draft model probability for x_draft)
+//              p_t from chain-filtered logits (penalties+top_k+top_p+temp)
+//              q_d = draft_probs[i]  (draft model top_k=10 probability)
 //
-//   p_t and q_d are both computed over chain-filtered candidate sets,
-//   satisfying the Leviathan requirement that both share the same
-//   probability space.  If draft_probs is null, q_d = 1.0 (conservative).
+//   Domain note: p_t and q_d come from different filtered candidate
+//   sets (target chain vs draft top_k=10), so they are not in the
+//   same probability space.  This gives a conservative acceptance
+//   bias (p_t denominator is larger → ratio is smaller → fewer
+//   accepts), which is always safe.  The Leviathan proof requires
+//   same-space; the conservative bias never violates it.
+//
+//   If draft_probs is null, q_d = 1.0 degenerating to r < p_t(x_draft).
 //
 //   On rejection:  resample from  norm(max(0, p_t - q_d)).
 //   Since q_d is only known at x_draft (one-hot draft assumption),
-//   the residual is p_t with x_draft zeroed.
+//   q_d(other) ≈ 0, so the residual is p_t with x_draft zeroed.
 //
 //   Bonus token:  sampled from the full target chain (identical to MTP-OFF).
 std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
@@ -721,14 +712,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
-    static llama_token s_think_end = LLAMA_TOKEN_NULL;
-    if (s_think_end == LLAMA_TOKEN_NULL) {
-        s_think_end = spec_find_think_end(vocab);
-        LOG_INF("[PROB_ACCEPT] s_think_end=%d '%s'\n",
-                s_think_end, common_token_to_piece(vocab, s_think_end, false).c_str());
-    }
-
     common_sampler_ptr smpl_tmp(common_sampler_clone(gsmpl));
+
+    // Get the thinking end-token from rbudget (single source of truth
+    // for all reasoning models — DeepSeek, Qwen, Gemma4, Mistral, etc.).
+    // Falls back to LLAMA_TOKEN_NULL for non-thinking models, which
+    // means the EOS workaround guards below will never fire.
+    const llama_token s_think_end = common_reasoning_budget_get_end_token(gsmpl->rbudget);
 
     const uint32_t accept_seed = llama_sampler_get_seed(smpl_tmp->chain) ^ 0xA7A7A7A7u;
     std::mt19937 accept_rng(accept_seed);
@@ -761,7 +751,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
         }
 
         // ---- Step 2: p_t(x_draft) from chain-filtered logits ----
-        // Same domain as q_d (both over filtered candidate sets).
+        // p_t is over target's filtered set (penalties+top_k+top_p+temp),
+        // q_d is over draft's top_k=10 set.  Different domains → ratio is
+        // conservatively biased.  See function header for details.
         float p_t = 0.0f;
         {
             float mx = -INFINITY;
@@ -780,7 +772,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
 
         const float q_d = draft_probs ? (*draft_probs)[i] : 1.0f;
 
-        LOG_INF("[PROB_ACCEPT] i=%zu draft=%d '%s' p_t=%.6f q_d=%.6f cur_size=%zu\n",
+        LOG_DBG("[PROB_ACCEPT] i=%zu draft=%d '%s' p_t=%.6f q_d=%.6f cur_size=%zu\n",
                 i, draft_token,
                 common_token_to_piece(vocab, draft_token, false).c_str(),
                 p_t, q_d, cur.size);
@@ -791,10 +783,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
             if (cur.data[j].id == draft_token) { p_logit = cur.data[j].logit; break; }
         }
         if (p_logit == -INFINITY) {
-            LOG_WRN("[PROB_ACCEPT] i=%zu -INF DRAFT draft=%d '%s' cur_size=%zu\n",
-                    i, draft_token,
-                    common_token_to_piece(vocab, draft_token, false).c_str(),
-                    cur.size);
+            // LOG_WRN("[PROB_ACCEPT] i=%zu -INF DRAFT draft=%d '%s' cur_size=%zu\n", ...);
             // rb or grammar suppressed the draft — resample from cur
             // Find and apply dist sampler
             for (int k = 0; k < llama_sampler_chain_n(smpl_tmp->chain); k++) {
@@ -812,7 +801,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                     llama_token_data_array sa = {&sd, 1, -1, false};
                     llama_sampler_apply(smpl_tmp->grmr, &sa);
                     if (sd.logit == -INFINITY) {
-                        LOG_WRN("[PROB_ACCEPT] -INF grammar-reject tok=%d, regenerating\n", sd.id);
+                        // LOG_DBG("[PROB_ACCEPT] -INF grammar-reject tok=%d, regenerating\n", sd.id);
                         smpl_tmp->set_logits(ctx, idxs[i]);
                         auto & c2 = smpl_tmp->cur_p;
                         llama_sampler_apply(smpl_tmp->rbudget, &c2);
@@ -823,10 +812,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 }
             }
             llama_token tok = cur.data[cur.selected].id;
-            LOG_WRN("[PROB_ACCEPT] -INF recovery=%d '%s' rbudget=%p is_eog=%d\n",
-                    tok, common_token_to_piece(vocab, tok, false).c_str(),
-                    (void*)smpl_tmp->rbudget,
-                    llama_vocab_is_eog(vocab, tok));
+            // LOG_WRN("[PROB_ACCEPT] -INF recovery=%d '%s' rbudget=%p is_eog=%d\n", ...);
             // EOS workaround: force </think> when reasoning is active
             if (llama_vocab_is_eog(vocab, tok) &&
                 smpl_tmp->rbudget &&
@@ -858,7 +844,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
             result.push_back(tok);
             llama_sampler_accept(smpl_tmp->chain, tok);
         } else {
-            LOG_WRN("[PROB_ACCEPT] REJECTED i=%zu draft=%d p_t=%.6f q_d=%.6f\n", i, draft_token, p_t, q_d);
+            // LOG_WRN("[PROB_ACCEPT] REJECTED i=%zu draft=%d p_t=%.6f q_d=%.6f\n", ...);
             // Rejected — zero the draft, dist-sample recovery
             for (size_t j = 0; j < cur.size; j++) {
                 if (cur.data[j].id == draft_token) { cur.data[j].logit = -INFINITY; break; }
@@ -877,7 +863,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 llama_token_data_array sa = {&sd, 1, -1, false};
                 llama_sampler_apply(smpl_tmp->grmr, &sa);
                 if (sd.logit == -INFINITY) {
-                    LOG_WRN("[PROB_ACCEPT] REJECT grammar-reject tok=%d, regenerating\n", sd.id);
+                    // LOG_DBG("[PROB_ACCEPT] REJECT grammar-reject tok=%d, regenerating\n", sd.id);
                     smpl_tmp->set_logits(ctx, idxs[i]);
                     auto & c2 = smpl_tmp->cur_p;
                     llama_sampler_apply(smpl_tmp->rbudget, &c2);
@@ -887,9 +873,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
                 }
             }
             llama_token tok = cur.data[cur.selected].id;
-            LOG_WRN("[PROB_ACCEPT] REJECT recovery=%d '%s' is_eog=%d\n",
-                    tok, common_token_to_piece(vocab, tok, false).c_str(),
-                    llama_vocab_is_eog(vocab, tok));
+            // LOG_WRN("[PROB_ACCEPT] REJECT recovery=%d '%s' is_eog=%d\n", ...);
             if (llama_vocab_is_eog(vocab, tok) &&
                 smpl_tmp->rbudget &&
                 (common_reasoning_budget_get_state(smpl_tmp->rbudget) == REASONING_BUDGET_COUNTING ||
@@ -927,7 +911,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_prob(
             }
         }
         llama_token tok = cur.data[cur.selected].id;
-        LOG_INF("[PROB_ACCEPT] bonus=%d '%s' is_eog=%d rbudget=%p\n",
+        LOG_DBG("[PROB_ACCEPT] bonus=%d '%s' is_eog=%d rbudget=%p\n",
                 tok, common_token_to_piece(vocab, tok, false).c_str(),
                 llama_vocab_is_eog(vocab, tok), (void*)smpl_tmp->rbudget);
         if (llama_vocab_is_eog(vocab, tok) &&

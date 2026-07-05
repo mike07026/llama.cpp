@@ -4107,7 +4107,7 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
-            LOG_INF("[SPEC_CYCLE] slot=%d n_draft=%zu n_decoded=%d\n",
+            LOG_DBG("[SPEC_CYCLE] slot=%d n_draft=%zu n_decoded=%d\n",
                     slot.id, n_draft, slot.n_decoded);
 
             // Leviathan probabilistic verification on a throwaway clone.
@@ -4139,20 +4139,17 @@ private:
                     for (size_t j = 0; j < accepted.size(); j++) {
                         bool is_eos = llama_vocab_is_eog(vocab, accepted[j]);
                         bool is_draft = j < slot.spec_draft.size() && accepted[j] == slot.spec_draft[j];
-                        LOG_INF("[SPEC_VERIFY] slot=%d pos=%zu/%zu tok=%d '%s' matched_draft=%d is_eos=%d n_rollback=%u\n",
+                        LOG_DBG("[SPEC_VERIFY] slot=%d pos=%zu/%zu tok=%d '%s' matched_draft=%d is_eos=%d n_rollback=%u\n",
                                 slot.id, j, accepted.size(), accepted[j],
                                 common_token_to_piece(slot.ctx_tgt, accepted[j], true).c_str(),
                                 (int)is_draft, (int)is_eos, n_rollback);
                         if (is_eos) {
-                            LOG_WRN("[SPEC_VERIFY] *** EOS DETECTED in accepted[%zu] *** tok=%d '%s' n_decoded=%d\n",
-                                    j, accepted[j],
-                                    common_token_to_piece(slot.ctx_tgt, accepted[j], true).c_str(),
-                                    slot.n_decoded);
+                            // LOG_WRN("[SPEC_VERIFY] *** EOS DETECTED in accepted[%zu] *** ...\n");
                         }
                     }
                     // Also log what the drafts were for comparison.
                     for (size_t j = 0; j < slot.spec_draft.size(); j++) {
-                        LOG_INF("[SPEC_DRAFT] slot=%d draft[%zu]=%d '%s'\n",
+                        LOG_DBG("[SPEC_DRAFT] slot=%d draft[%zu]=%d '%s'\n",
                                 slot.id, j, slot.spec_draft[j],
                                 common_token_to_piece(slot.ctx_tgt, slot.spec_draft[j], true).c_str());
                     }
